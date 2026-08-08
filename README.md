@@ -1,2 +1,2 @@
 # web-doorbell-php
-A Simple Doorbell System Using a Web Browser
+a simple doorbell system Using web browser

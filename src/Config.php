@@ -13,6 +13,7 @@ final class Config
     private const DEFAULTS = [
         'polling_interval'       => 10,
         'admin_password'         => '1234',
+        'admin_session_lifetime' => 1800,
         'max_ids_per_instance'   => 100,
         'max_children_per_id'    => 1,
         'max_parents_per_id'     => 1,
@@ -59,24 +60,29 @@ final class Config
         $values['rate_limit'] = array_merge(self::DEFAULTS['rate_limit'], $loaded['rate_limit'] ?? []);
         $values['db_path'] ??= \dirname(__DIR__) . '/data/doorbell.sqlite';
 
-        // テスト実行時に本番データを壊さないよう、DBの場所を環境変数で差し替えられるようにする
-        $dbPathOverride = getenv('DOORBELL_DB_PATH');
-        if (is_string($dbPathOverride) && $dbPathOverride !== '') {
-            $values['db_path'] = $dbPathOverride;
+        // テスト実行時に本番データを壊さないよう、DBの場所を環境変数で差し替えられるようにする。
+        // Web サーバー経由（php-fpm / mod_php / CGI）では受け付けない。
+        // それらの SAPI では環境変数がリクエスト由来の値で汚染されうるため。
+        if (\in_array(PHP_SAPI, ['cli', 'cli-server'], true)) {
+            $dbPathOverride = getenv('DOORBELL_DB_PATH');
+            if (is_string($dbPathOverride) && $dbPathOverride !== '') {
+                $values['db_path'] = $dbPathOverride;
+            }
         }
 
         // 極端な値で動作不能にならないよう最低限の丸め込みを行う
-        $values['polling_interval']      = max(1, (int) $values['polling_interval']);
-        $values['max_ids_per_instance']  = max(1, (int) $values['max_ids_per_instance']);
-        $values['max_children_per_id']   = max(1, (int) $values['max_children_per_id']);
-        $values['max_parents_per_id']    = max(1, (int) $values['max_parents_per_id']);
-        $values['max_ids_per_ip']        = max(1, (int) $values['max_ids_per_ip']);
-        $values['ringtone_repeat']       = max(1, (int) $values['ringtone_repeat']);
-        $values['absence_timeout']       = max(5, (int) $values['absence_timeout']);
-        $values['response_view_timeout'] = max(5, (int) $values['response_view_timeout']);
-        $values['parent_offline_polls']  = max(2, (int) $values['parent_offline_polls']);
-        $values['offline_stop_seconds']  = max(60, (int) $values['offline_stop_seconds']);
-        $values['child_status_window']   = max(60, (int) $values['child_status_window']);
+        $values['polling_interval']       = max(1, (int) $values['polling_interval']);
+        $values['admin_session_lifetime'] = max(60, (int) $values['admin_session_lifetime']);
+        $values['max_ids_per_instance']   = max(1, (int) $values['max_ids_per_instance']);
+        $values['max_children_per_id']    = max(1, (int) $values['max_children_per_id']);
+        $values['max_parents_per_id']     = max(1, (int) $values['max_parents_per_id']);
+        $values['max_ids_per_ip']         = max(1, (int) $values['max_ids_per_ip']);
+        $values['ringtone_repeat']        = max(1, (int) $values['ringtone_repeat']);
+        $values['absence_timeout']        = max(5, (int) $values['absence_timeout']);
+        $values['response_view_timeout']  = max(5, (int) $values['response_view_timeout']);
+        $values['parent_offline_polls']   = max(2, (int) $values['parent_offline_polls']);
+        $values['offline_stop_seconds']   = max(60, (int) $values['offline_stop_seconds']);
+        $values['child_status_window']    = max(60, (int) $values['child_status_window']);
 
         self::$values = $values;
         return self::$values;

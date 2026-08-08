@@ -12,12 +12,36 @@ require __DIR__ . '/../src/bootstrap.php';
 
 Http::startSession();
 
-$ip          = Http::clientIp();
-$limits      = (array) Config::get('rate_limit');
-$error       = '';
-$issued      = null;
-$deleted     = '';
-$isLoggedIn  = ($_SESSION['admin_authenticated'] ?? false) === true;
+/**
+ * 管理画面のログイン状態。
+ * 一定時間操作がなければ失効させる（画面を開いたまま放置された端末を保護するため）。
+ */
+function adminAuthenticated(): bool
+{
+    if (($_SESSION['admin_authenticated'] ?? false) !== true) {
+        return false;
+    }
+
+    $lastActive = (int) ($_SESSION['admin_last_active'] ?? 0);
+    if (time() - $lastActive >= Config::int('admin_session_lifetime')) {
+        unset($_SESSION['admin_authenticated'], $_SESSION['admin_last_active']);
+        return false;
+    }
+
+    $_SESSION['admin_last_active'] = time();
+    return true;
+}
+
+$ip      = Http::clientIp();
+$limits  = (array) Config::get('rate_limit');
+$issued  = null;
+$deleted = '';
+
+$hadSession = isset($_SESSION['admin_authenticated']);
+$isLoggedIn = adminAuthenticated(); // 失効していれば、ここでセッションから取り除かれる
+$error      = $hadSession && !$isLoggedIn
+    ? 'ログインの有効期限が切れました。もう一度ログインしてください。'
+    : '';
 
 try {
     Http::rateLimit('req', $ip, (int) $limits['max_requests']);
@@ -28,21 +52,26 @@ try {
 
         switch ($action) {
             case 'login':
-                Http::rateLimit('login', $ip, (int) $limits['max_logins']);
+                // メイン画面のログインとは別のバケットにする。
+                // 共有すると、子機のログイン成功でこの試行回数を巻き戻せてしまうため
+                Http::rateLimit('login_admin', $ip, (int) $limits['max_logins']);
                 $password = (string) ($_POST['password'] ?? '');
                 if (hash_equals((string) Config::get('admin_password'), $password)) {
                     session_regenerate_id(true);
                     $_SESSION['admin_authenticated'] = true;
+                    $_SESSION['admin_last_active']   = time();
                     $isLoggedIn = true;
-                    Http::rateLimitRelease('login', $ip);
+                    $error      = '';
+                    Http::rateLimitRelease('login_admin', $ip);
                 } else {
                     $error = 'パスワードが正しくありません。';
                 }
                 break;
 
             case 'logout':
-                unset($_SESSION['admin_authenticated']);
+                unset($_SESSION['admin_authenticated'], $_SESSION['admin_last_active']);
                 $isLoggedIn = false;
+                $error      = '';
                 break;
 
             case 'issue':

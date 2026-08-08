@@ -18,6 +18,9 @@ return [
     // ID発行画面のパスワード
     'admin_password' => '1234',
 
+    // ID発行画面のログインが失効するまでの無操作時間（秒）
+    'admin_session_lifetime' => 1800,
+
     // サーバー1インスタンスあたりの最大ID数
     'max_ids_per_instance' => 100,
 

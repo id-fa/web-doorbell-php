@@ -21,7 +21,7 @@ final class Database
 
         $path = (string) Config::get('db_path');
         $dir  = \dirname($path);
-        if (!is_dir($dir) && !@mkdir($dir, 0o770, true) && !is_dir($dir)) {
+        if (!is_dir($dir) && !@mkdir($dir, 0o700, true) && !is_dir($dir)) {
             throw new \RuntimeException('データベースディレクトリを作成できません: ' . $dir);
         }
 
@@ -39,8 +39,35 @@ final class Database
 
         self::$pdo = $pdo;
         self::migrate($pdo);
+        self::restrictPermissions($path);
 
         return self::$pdo;
+    }
+
+    /**
+     * DB ファイルを所有者以外から読めないようにする。
+     *
+     * 共有ホスティングでは同居する他ユーザーからファイルを読まれる可能性があるため。
+     * -wal / -shm は SQLite が本体と同じパーミッションで作り直すので、本体だけを見ればよい。
+     * 権限が既に正しいときは何もしない（毎リクエストの chmod を避ける）。
+     *
+     * Windows では chmod が成功を返しても実際には変化せず、毎回無駄に呼ぶことになるため何もしない。
+     */
+    private static function restrictPermissions(string $path): void
+    {
+        if (DIRECTORY_SEPARATOR !== '/') {
+            return;
+        }
+
+        $perms = @fileperms($path);
+        if ($perms !== false && ($perms & 0o077) !== 0) {
+            @chmod($path, 0o600);
+            foreach ([$path . '-wal', $path . '-shm'] as $sidecar) {
+                if (is_file($sidecar)) {
+                    @chmod($sidecar, 0o600);
+                }
+            }
+        }
     }
 
     /** テーブルを作成する（存在すれば何もしない） */
@@ -64,6 +91,7 @@ final class Database
                 role         TEXT    NOT NULL CHECK (role IN ('parent', 'child')),
                 display_name TEXT    NOT NULL,
                 ip           TEXT    NOT NULL,
+                session_key  TEXT    NOT NULL DEFAULT '',
                 created_at   INTEGER NOT NULL,
                 last_seen_at INTEGER NOT NULL,
                 UNIQUE (doorbell_id, device_key),
@@ -72,6 +100,13 @@ final class Database
         SQL);
         $pdo->exec('CREATE INDEX IF NOT EXISTS idx_devices_active ON devices (doorbell_id, role, last_seen_at)');
         $pdo->exec('CREATE INDEX IF NOT EXISTS idx_devices_ip ON devices (ip, role, last_seen_at)');
+
+        // 既存の DB には CREATE TABLE IF NOT EXISTS で列が追加されないため、個別に足す。
+        // 既存の端末は session_key が空のままになり、次回ログインまで未認証として扱われる。
+        $columns = $pdo->query('PRAGMA table_info(devices)')->fetchAll(PDO::FETCH_COLUMN, 1);
+        if (!in_array('session_key', $columns, true)) {
+            $pdo->exec("ALTER TABLE devices ADD COLUMN session_key TEXT NOT NULL DEFAULT ''");
+        }
 
         $pdo->exec(<<<'SQL'
             CREATE TABLE IF NOT EXISTS calls (

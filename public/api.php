@@ -30,6 +30,11 @@ try {
 
     switch ($action) {
         case 'login':
+            // 総当たり（ID の列挙・パスワード試行）と、bcrypt 検証による CPU 消費を抑える。
+            // 管理画面とは別のバケットを使う。共有すると、こちらのログイン成功で
+            // 管理画面側の試行回数を巻き戻せてしまうため
+            Http::rateLimit('login_device', $ip, (int) $limits['max_logins']);
+
             $device = Doorbell::login(
                 (string) ($input['doorbell_id'] ?? ''),
                 (string) ($input['password'] ?? ''),
@@ -41,10 +46,11 @@ try {
             // セッション固定化攻撃を避けるため、ログイン成功時にIDを再生成する
             $csrf = $_SESSION['csrf_token'];
             session_regenerate_id(true);
-            $_SESSION['csrf_token'] = $csrf;
-            $_SESSION['device_id']  = (int) $device['id'];
+            $_SESSION['csrf_token']     = $csrf;
+            $_SESSION['device_id']      = (int) $device['id'];
+            $_SESSION['device_session'] = (string) $device['session_key'];
 
-            Http::rateLimitRelease('login', $ip);
+            Http::rateLimitRelease('login_device', $ip);
             Http::json([
                 'ok'        => true,
                 'deviceKey' => (string) $device['device_key'],
@@ -55,7 +61,7 @@ try {
         case 'logout':
             if (isset($_SESSION['device_id'])) {
                 Doorbell::logout((int) $_SESSION['device_id']);
-                unset($_SESSION['device_id']);
+                unset($_SESSION['device_id'], $_SESSION['device_session']);
             }
             Http::json(['ok' => true]);
 
@@ -93,14 +99,15 @@ try {
     Http::json(['ok' => false, 'code' => 'server_error', 'message' => 'サーバーエラーが発生しました。'], 500);
 }
 
-/** ログイン済み端末を取得する（未ログインならエラー） */
+/** ログイン済み端末を取得する（未ログイン、または同じ端末が別セッションでログインし直したならエラー） */
 function currentDevice(): array
 {
-    $deviceId = (int) ($_SESSION['device_id'] ?? 0);
-    $device   = $deviceId > 0 ? Doorbell::device($deviceId) : null;
+    $deviceId   = (int) ($_SESSION['device_id'] ?? 0);
+    $sessionKey = (string) ($_SESSION['device_session'] ?? '');
+    $device     = $deviceId > 0 ? Doorbell::device($deviceId, $sessionKey) : null;
 
     if ($device === null) {
-        unset($_SESSION['device_id']);
+        unset($_SESSION['device_id'], $_SESSION['device_session']);
         throw new AppError('ログインしていません。', 'unauthenticated', 401);
     }
 

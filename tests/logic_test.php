@@ -245,6 +245,40 @@ try {
     check('サーバー全体のID数上限', $e->errorCode === 'limit_instance', $e->getMessage());
 }
 
+echo "== ログインの失敗応答 ==\n";
+// 直前の上限テストでID数が上限に達しているため、発行できるように空にする
+$pdo->exec('DELETE FROM doorbell_ids');
+
+// ID の誤りとパスワードの誤りを区別すると、有効なIDを総当たりで発見できてしまう
+$creds = Doorbell::issueId('198.51.100.9');
+$codes = [];
+foreach ([['00000000', 'x'], [$creds['doorbell_id'], 'wrongpass']] as [$tryId, $tryPw]) {
+    try {
+        Doorbell::login($tryId, $tryPw, 'x', str_repeat('f', 16), '198.51.100.9');
+        $codes[] = 'ログインできてしまった';
+    } catch (AppError $e) {
+        $codes[] = $e->errorCode;
+    }
+}
+check('IDの誤りとパスワードの誤りで応答が変わらない', $codes[0] === $codes[1], json_encode($codes));
+check('失敗時のエラー種別が invalid_credentials', $codes[0] === 'invalid_credentials', json_encode($codes));
+
+echo "== 端末のセッション鍵 ==\n";
+$key   = str_repeat('9', 16);
+$first = Doorbell::login($creds['doorbell_id'], $creds['child_password'], '端末A', $key, '198.51.100.9');
+check('ログインでセッション鍵が発行される', ($first['session_key'] ?? '') !== '');
+check('発行直後のセッション鍵で認証できる', Doorbell::device((int) $first['id'], (string) $first['session_key']) !== null);
+
+// 同じ device_key で入り直すと、前のセッションは無効になる（上限の回避を防ぐため）
+$second = Doorbell::login($creds['doorbell_id'], $creds['child_password'], '端末B', $key, '198.51.100.9');
+check('再ログインでセッション鍵が変わる', $second['session_key'] !== $first['session_key']);
+check('古いセッション鍵は無効になる', Doorbell::device((int) $first['id'], (string) $first['session_key']) === null);
+check('新しいセッション鍵は有効', Doorbell::device((int) $second['id'], (string) $second['session_key']) !== null);
+check('空のセッション鍵では認証できない', Doorbell::device((int) $second['id'], '') === null);
+
+Doorbell::logout((int) $second['id']);
+check('ログアウト後はセッション鍵が使えない', Doorbell::device((int) $second['id'], (string) $second['session_key']) === null);
+
 echo "== ID の正規化 ==\n";
 check('ハイフン付きIDを受け付ける', Doorbell::normalizeId('1234-5678') === '12345678');
 check('桁数違いは無効', Doorbell::normalizeId('123') === '');

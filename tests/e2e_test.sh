@@ -110,12 +110,17 @@ curl -s -c "$WORK/child.cookie" -o "$WORK/c1.html" "$BASE/index.php"
 CC=$(grep -o '"csrfToken":"[a-f0-9]*"' "$WORK/c1.html" | grep -o '[a-f0-9]\{64\}')
 
 OUT=$(api parent.cookie "$PC" '{"action":"login","doorbell_id":"0000-0000","password":"x","display_name":"desk"}')
-grep -q 'invalid_id' <<< "$OUT" && R=1 || R=0
+grep -q 'invalid_credentials' <<< "$OUT" && R=1 || R=0
 check "無効なIDはエラーになる" "$R" "$OUT"
+NOID="$OUT"
 
 OUT=$(api parent.cookie "$PC" "{\"action\":\"login\",\"doorbell_id\":\"$DID\",\"password\":\"wrong\",\"display_name\":\"desk\"}")
-grep -q 'invalid_password' <<< "$OUT" && R=1 || R=0
+grep -q 'invalid_credentials' <<< "$OUT" && R=1 || R=0
 check "誤ったパスワードはエラーになる" "$R" "$OUT"
+
+# ID の誤りとパスワードの誤りを区別すると、有効なIDを総当たりで発見できてしまう
+[ "$NOID" = "$OUT" ] && R=1 || R=0
+check "IDの誤りとパスワードの誤りが区別できない" "$R" "存在しないID=$NOID / 存在するID=$OUT"
 
 OUT=$(api parent.cookie "$PC" "{\"action\":\"login\",\"doorbell_id\":\"$DID\",\"password\":\"$PPW\",\"display_name\":\"$PARENT_NAME\",\"device_key\":\"aaaaaaaaaaaaaaaa\"}")
 grep -q '"role":"parent"' <<< "$OUT" && R=1 || R=0
@@ -201,6 +206,60 @@ api child.cookie "$CC" '{"action":"logout"}' > /dev/null
 OUT=$(api parent.cookie "$PC" "{\"action\":\"login\",\"doorbell_id\":\"$DID\",\"password\":\"$PPW\",\"display_name\":\"$PARENT_NAME\",\"device_key\":\"aaaaaaaaaaaaaaaa\"}")
 grep -q '"children":\[\]' <<< "$OUT" && R=1 || R=0
 check "ログアウトした子機は親機の一覧から消える" "$R" "$OUT"
+
+echo "== 端末キーの使い回しによる同時接続上限の回避 =="
+# device_key はクライアント由来なので、同じ値を送れば上限のカウントから外れてしまう。
+# 端末ごとに有効なセッションを1つに絞ることで、枠を増やせないようにしている。
+curl -s -c "$WORK/dk1.cookie" -o "$WORK/d1.html" "$BASE/index.php"
+D1=$(grep -o '"csrfToken":"[a-f0-9]*"' "$WORK/d1.html" | grep -o '[a-f0-9]\{64\}')
+curl -s -c "$WORK/dk2.cookie" -o "$WORK/d2.html" "$BASE/index.php"
+D2=$(grep -o '"csrfToken":"[a-f0-9]*"' "$WORK/d2.html" | grep -o '[a-f0-9]\{64\}')
+DK='cccccccccccccccc'
+
+api dk1.cookie "$D1" "{\"action\":\"login\",\"doorbell_id\":\"$DID\",\"password\":\"$CPW\",\"display_name\":\"端末A\",\"device_key\":\"$DK\"}" > /dev/null
+OUT=$(api dk2.cookie "$D2" "{\"action\":\"login\",\"doorbell_id\":\"$DID\",\"password\":\"$CPW\",\"display_name\":\"端末B\",\"device_key\":\"$DK\"}")
+grep -q '"role":"child"' <<< "$OUT" && R=1 || R=0
+check "同じ端末キーでの再ログインは受け付ける" "$R" "$OUT"
+
+OUT=$(api dk1.cookie "$D1" '{"action":"state"}')
+grep -q 'unauthenticated' <<< "$OUT" && R=1 || R=0
+check "先にログインしたセッションは無効になる" "$R" "$OUT"
+
+OUT=$(api dk2.cookie "$D2" '{"action":"state"}')
+grep -q '"role":"child"' <<< "$OUT" && R=1 || R=0
+check "後からログインしたセッションだけが有効" "$R" "$OUT"
+
+echo "== レート制限のバケット分離 =="
+# 管理画面の試行回数を使い切る
+curl -s -c "$WORK/adm2.cookie" -o "$WORK/b1.html" "$BASE/admin.php"
+BC=$(csrf_of "$WORK/b1.html")
+admin_login() { # $1=パスワード
+    curl -s -b "$WORK/adm2.cookie" -c "$WORK/adm2.cookie" -o "$WORK/b2.html" \
+         -d "csrf_token=$BC&action=login&password=$1" "$BASE/admin.php"
+    grep -q 'アクセスが集中' "$WORK/b2.html" && echo limited || echo tried
+}
+LIMITED=0
+for i in $(seq 1 15); do
+    [ "$(admin_login "bad$i")" = "limited" ] && { LIMITED=$i; break; }
+done
+[ "$LIMITED" -gt 0 ] && R=1 || R=0
+check "管理画面のログイン試行がレート制限される" "$R" "15回試行しても制限されなかった"
+
+# メイン画面のログイン成功で管理画面の試行回数が戻らないこと（バケットを共有していると戻ってしまう）
+for i in 1 2 3; do
+    api dk2.cookie "$D2" "{\"action\":\"login\",\"doorbell_id\":\"$DID\",\"password\":\"$CPW\",\"display_name\":\"端末B\",\"device_key\":\"$DK\"}" > /dev/null
+done
+[ "$(admin_login 'bad99')" = "limited" ] && R=1 || R=0
+check "メイン画面のログイン成功で管理画面の制限が戻らない" "$R" "制限が解除された"
+
+echo "== メイン画面のログイン試行のレート制限 =="
+LIMITED=0
+for i in $(seq 1 15); do
+    OUT=$(api dk1.cookie "$D1" "{\"action\":\"login\",\"doorbell_id\":\"$DID\",\"password\":\"bad$i\",\"display_name\":\"x\"}")
+    grep -q 'rate_limited' <<< "$OUT" && { LIMITED=$i; break; }
+done
+[ "$LIMITED" -gt 0 ] && R=1 || R=0
+check "メイン画面のログイン試行がレート制限される" "$R" "15回試行しても制限されなかった"
 
 echo "== 非公開ファイルの秘匿 =="
 for path in config/config.php data/doorbell.sqlite src/Doorbell.php; do

@@ -31,6 +31,15 @@ final class Doorbell
     /** 発行するパスワードに使う文字（0/O/1/l/I など紛らわしい文字は除外） */
     private const PASSWORD_ALPHABET = '23456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
 
+    /**
+     * bcrypt のコスト。
+     *
+     * PASSWORD_DEFAULT を使わず明示的に固定する。既定値は PHP のバージョンで変わるため
+     * （8.4 で 10 → 12 に変更）、ID が存在しないときのダミー検証とコストがずれ、
+     * 応答時間の差から ID の存在を判定できてしまうのを防ぐ。
+     */
+    private const BCRYPT_COST = 12;
+
     // ------------------------------------------------------------------
     // ID 発行
     // ------------------------------------------------------------------
@@ -74,8 +83,8 @@ final class Doorbell
                     VALUES (:id, :parent, :child, :ip, :now)
                 SQL)->execute([
                     ':id'     => $doorbellId,
-                    ':parent' => password_hash($parentPassword, PASSWORD_DEFAULT),
-                    ':child'  => password_hash($childPassword, PASSWORD_DEFAULT),
+                    ':parent' => self::hashPassword($parentPassword),
+                    ':child'  => self::hashPassword($childPassword),
                     ':ip'     => $ip,
                     ':now'    => $now,
                 ]);
@@ -171,16 +180,20 @@ final class Doorbell
         $stmt->execute([':id' => $doorbellId]);
         $record = $stmt->fetch();
 
-        if ($record === false) {
-            // タイミング差から ID の存在を推測されないようダミー検証を行う
-            password_verify($password, '$2y$10$usesomesillystringfoeXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX');
-            throw new AppError('IDが無効です。', 'invalid_id');
-        }
+        // ID の存在有無で検証回数が変わらないよう、常に親機・子機の両方を検証する。
+        // 該当する ID がなければ同じコストのダミーハッシュで代用し、応答時間を揃える。
+        $dummy      = self::dummyHash();
+        $parentHash = $record === false ? $dummy : (string) $record['parent_password_hash'];
+        $childHash  = $record === false ? $dummy : (string) $record['child_password_hash'];
 
+        $isParent = password_verify($password, $parentHash);
+        $isChild  = password_verify($password, $childHash);
+
+        // ID の誤りとパスワードの誤りを区別すると、有効な ID を総当たりで発見できてしまう
         $role = match (true) {
-            password_verify($password, (string) $record['parent_password_hash']) => 'parent',
-            password_verify($password, (string) $record['child_password_hash'])  => 'child',
-            default => throw new AppError('パスワードが正しくありません。', 'invalid_password'),
+            $record !== false && $isParent => 'parent',
+            $record !== false && $isChild  => 'child',
+            default => throw new AppError('IDまたはパスワードが正しくありません。', 'invalid_credentials'),
         };
 
         $now    = time();
@@ -216,21 +229,28 @@ final class Doorbell
             }
         }
 
+        // 端末ごとに1つだけ有効なセッション鍵を発行する。
+        // device_key はクライアント由来なので、同じ値を送れば同時接続数の上限を回避できてしまう。
+        // ログインのたびに鍵を作り直し、同じ端末の古いセッションを無効化することで上限を実効化する。
+        $sessionKey = bin2hex(random_bytes(16));
+
         $pdo->prepare(<<<'SQL'
-            INSERT INTO devices (doorbell_id, device_key, role, display_name, ip, created_at, last_seen_at)
-            VALUES (:id, :key, :role, :name, :ip, :now, :now)
+            INSERT INTO devices (doorbell_id, device_key, role, display_name, ip, session_key, created_at, last_seen_at)
+            VALUES (:id, :key, :role, :name, :ip, :session, :now, :now)
             ON CONFLICT (doorbell_id, device_key) DO UPDATE SET
                 role         = :role,
                 display_name = :name,
                 ip           = :ip,
+                session_key  = :session,
                 last_seen_at = :now
         SQL)->execute([
-            ':id'   => $doorbellId,
-            ':key'  => $deviceKey,
-            ':role' => $role,
-            ':name' => $displayName,
-            ':ip'   => $ip,
-            ':now'  => $now,
+            ':id'      => $doorbellId,
+            ':key'     => $deviceKey,
+            ':role'    => $role,
+            ':name'    => $displayName,
+            ':ip'      => $ip,
+            ':session' => $sessionKey,
+            ':now'     => $now,
         ]);
 
         $deviceStmt = $pdo->prepare('SELECT * FROM devices WHERE doorbell_id = :id AND device_key = :key');
@@ -243,8 +263,14 @@ final class Doorbell
         return $device;
     }
 
-    /** セッションに保存された端末IDから端末レコードを取得する */
-    public static function device(int $deviceId): ?array
+    /**
+     * セッションに保存された端末IDから端末レコードを取得する。
+     *
+     * $sessionKey が端末の現在の鍵と一致しない場合は無効とみなす。
+     * 同じ device_key で後からログインされたセッション（＝同じ端末の別ウィンドウ）を締め出し、
+     * 1端末が同時接続数の枠を1つしか使えないようにするため。
+     */
+    public static function device(int $deviceId, string $sessionKey): ?array
     {
         $stmt = Database::pdo()->prepare('SELECT * FROM devices WHERE id = :id');
         $stmt->execute([':id' => $deviceId]);
@@ -254,6 +280,9 @@ final class Doorbell
             return null;
         }
         if ((int) $device['last_seen_at'] < time() - Config::int('session_lifetime')) {
+            return null;
+        }
+        if ($sessionKey === '' || !hash_equals((string) $device['session_key'], $sessionKey)) {
             return null;
         }
 
@@ -271,8 +300,9 @@ final class Doorbell
     /** ログアウト（枠をすぐ解放するため last_seen_at を過去にする） */
     public static function logout(int $deviceId): void
     {
+        // セッション鍵も破棄し、残っているセッションを再利用できないようにする
         Database::pdo()
-            ->prepare('UPDATE devices SET last_seen_at = 0 WHERE id = :id')
+            ->prepare("UPDATE devices SET last_seen_at = 0, session_key = '' WHERE id = :id")
             ->execute([':id' => $deviceId]);
     }
 
@@ -655,6 +685,24 @@ final class Doorbell
     private static function normalizeDeviceKey(string $key): string
     {
         return preg_match('/\A[0-9a-f]{16,64}\z/', $key) === 1 ? $key : bin2hex(random_bytes(16));
+    }
+
+    /** パスワードをハッシュ化する（コストは BCRYPT_COST に固定する） */
+    private static function hashPassword(string $password): string
+    {
+        return password_hash($password, PASSWORD_BCRYPT, ['cost' => self::BCRYPT_COST]);
+    }
+
+    /**
+     * ID が存在しないときに検証するダミーハッシュ。
+     *
+     * 実際に保存されるハッシュと同じコストで組み立てるため、検証にかかる時間が一致する。
+     * ソルト部の `.` は bcrypt の文字集合に含まれるので、password_verify は
+     * 形式エラーで早期に false を返さず、最後まで計算を行う。
+     */
+    private static function dummyHash(): string
+    {
+        return sprintf('$2y$%02d$%s', self::BCRYPT_COST, str_repeat('.', 53));
     }
 
     private static function randomDoorbellId(): string

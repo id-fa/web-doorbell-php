@@ -18,7 +18,7 @@ $bootstrapData = [
     'responses'       => Doorbell::RESPONSES,
     'responseLabels'  => Doorbell::RESPONSE_LABELS,
     'noAnswerMessage' => Doorbell::NO_ANSWER_MESSAGE,
-    'loggedIn'        => isset($_SESSION['device_id']),
+    'loggedIn'        => isset($_SESSION['device_id'], $_SESSION['device_session']),
 ];
 
 header('X-Content-Type-Options: nosniff');

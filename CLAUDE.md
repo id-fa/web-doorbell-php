@@ -36,6 +36,8 @@ php -r "require 'src/bootstrap.php'; use Doorbell\Doorbell; print_r(Doorbell::is
 
 テストは一時ファイルの SQLite を使うため `data/` の実データを壊さない。
 DB の場所は環境変数 `DOORBELL_DB_PATH` で上書きできる（`Config::load()` が解釈する）。
+これは CLI と組み込みサーバー（SAPI が `cli` / `cli-server`）でのみ有効。
+php-fpm 等の本番 SAPI では無視されるので、テストからは今までどおり使える。
 
 ブラウザで手動確認するときの注意:
 
@@ -88,10 +90,14 @@ cron やバックグラウンドジョブは存在しない。以下はすべて
 
 ### 認証と端末の同一性は別物
 
-- **認証**は PHP セッション（`$_SESSION['device_id']`）。ログイン成功時に `session_regenerate_id()`
+- **認証**は PHP セッション（`$_SESSION['device_id']` + `$_SESSION['device_session']`）。
+  ログイン成功時に `session_regenerate_id()`
 - **端末の同一性**は `localStorage` の `device_key`（クライアント由来なので信頼しない）。
   再ログインしても同じ `devices` 行を使い回すことで、子機の履歴が継続し、
   同時接続数のカウントも二重にならない
+- **1端末につき有効なセッションは1つ**。ログインのたびに `devices.session_key` を作り直し、
+  `Doorbell::device()` がセッション側の値と照合する。`device_key` はクライアントが自由に選べるので、
+  これがないと同じ値を送るだけで `max_children_per_id` / `max_parents_per_id` を回避できてしまう
 
 ### 呼び出しのライフサイクル
 
@@ -128,6 +134,17 @@ WHERE created_at <= :deadline
 - 設定項目を増やすときは `Config::DEFAULTS` と `config/config.sample.php` の両方に追加する。
   クライアントに渡す必要があるものだけ `Config::publicValues()` に載せる（秘匿値を混ぜない）
 - `config/config.php` は `.gitignore` 済み。既定の管理パスワードは `1234` のまま
+
+### ログイン失敗の応答を変えない
+
+`Doorbell::login()` は、ID が存在しない場合とパスワードが違う場合で
+**応答も処理時間も同じ**でなければならない。区別できると 8 桁の ID を総当たりで発見できる。
+
+- エラーは種別・文言とも `invalid_credentials` に統一する。ID 専用のエラーを足さない
+- 検証は常に 2 回（親機・子機）行う。ID がなければ `dummyHash()` で代用する
+- `password_hash()` は `PASSWORD_DEFAULT` ではなく `BCRYPT_COST` を明示して使う。
+  既定コストは PHP のバージョンで変わり（8.4 で 10 → 12）、ダミー側とずれると
+  応答時間の差だけで ID の存在が判別できてしまう
 
 ### クライアント側で壊しやすい設計判断
 

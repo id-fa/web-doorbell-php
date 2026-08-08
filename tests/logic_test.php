@@ -276,8 +276,69 @@ check('古いセッション鍵は無効になる', Doorbell::device((int) $firs
 check('新しいセッション鍵は有効', Doorbell::device((int) $second['id'], (string) $second['session_key']) !== null);
 check('空のセッション鍵では認証できない', Doorbell::device((int) $second['id'], '') === null);
 
+echo "== ログアウト時のパスワード確認 ==\n";
+// 置きっぱなしの子機を勝手にログアウトされないようにする（親機は対象外）
+check('子機はログアウトにパスワードが必要', Doorbell::logoutNeedsPassword($second) === true);
+check('親機はログアウトにパスワード不要', Doorbell::logoutNeedsPassword($again) === false);
+check('子機パスワードで検証が通る', Doorbell::verifyPassword($second, $creds['child_password']) === true);
+check('親機パスワードでは通らない', Doorbell::verifyPassword($second, $creds['parent_password']) === false);
+check('空のパスワードでは通らない', Doorbell::verifyPassword($second, '') === false);
+
 Doorbell::logout((int) $second['id']);
 check('ログアウト後はセッション鍵が使えない', Doorbell::device((int) $second['id'], (string) $second['session_key']) === null);
+
+echo "== 子機URL（自動ログイン） ==\n";
+$linkId = Doorbell::issueId('198.51.100.20');
+$link   = Doorbell::createChildLink($linkId['doorbell_id'], '  勝手口  ');
+check('トークンは16進32桁', Doorbell::normalizeToken($link['token']) === $link['token'], $link['token']);
+check('表示名は前後の空白を落として保持する', $link['display_name'] === '勝手口', $link['display_name']);
+
+$linked = Doorbell::loginByLink($link['token'], str_repeat('e', 16), '198.51.100.21');
+check('子機URLでログインできる', (string) $linked['role'] === 'child');
+check('リンクの表示名が端末に設定される', (string) $linked['display_name'] === '勝手口');
+check('セッション鍵が発行される', ($linked['session_key'] ?? '') !== '');
+check(
+    'リンクで入った子機が親機から見える',
+    Doorbell::childStatuses($linkId['doorbell_id']) !== [],
+);
+
+// 表示名なしでは発行できない（端末の識別ができなくなるため）
+try {
+    Doorbell::createChildLink($linkId['doorbell_id'], '   ');
+    check('表示名なしの子機URLは発行できない', false, '例外が発生しなかった');
+} catch (AppError $e) {
+    check('表示名なしの子機URLは発行できない', $e->errorCode === 'invalid_input', $e->getMessage());
+}
+
+// 存在しないIDには発行できない
+try {
+    Doorbell::createChildLink('00000000', '玄関');
+    check('存在しないIDには発行できない', false, '例外が発生しなかった');
+} catch (AppError $e) {
+    check('存在しないIDには発行できない', $e->errorCode === 'unknown_id', $e->getMessage());
+}
+
+// 失効させたトークンでは入れない
+check('失効させられる', Doorbell::deleteChildLink($link['token']) === true);
+try {
+    Doorbell::loginByLink($link['token'], str_repeat('e', 16), '198.51.100.21');
+    check('失効した子機URLでは入れない', false, '例外が発生しなかった');
+} catch (AppError $e) {
+    check('失効した子機URLでは入れない', $e->errorCode === 'invalid_link', $e->getMessage());
+}
+
+// 形式の違うトークンも同じエラーにまとめる
+try {
+    Doorbell::loginByLink('not-a-token', str_repeat('e', 16), '198.51.100.21');
+    check('不正な形式のトークンは拒否される', false, '例外が発生しなかった');
+} catch (AppError $e) {
+    check('不正な形式のトークンは拒否される', $e->errorCode === 'invalid_link', $e->getMessage());
+}
+
+// ID を削除するとリンクも消える（外部キーの ON DELETE CASCADE）
+$link2 = Doorbell::createChildLink($linkId['doorbell_id'], '裏口');
+Doorbell::deleteId($linkId['doorbell_id']);
+check('ID削除でリンクも消える', Doorbell::deleteChildLink($link2['token']) === false);
 
 echo "== ID の正規化 ==\n";
 check('ハイフン付きIDを受け付ける', Doorbell::normalizeId('1234-5678') === '12345678');

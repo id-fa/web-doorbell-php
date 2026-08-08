@@ -32,10 +32,12 @@ function adminAuthenticated(): bool
     return true;
 }
 
-$ip      = Http::clientIp();
-$limits  = (array) Config::get('rate_limit');
-$issued  = null;
-$deleted = '';
+$ip          = Http::clientIp();
+$limits      = (array) Config::get('rate_limit');
+$issued      = null;
+$deleted     = '';
+$issuedLink  = null;
+$linkEnabled = (bool) Config::get('child_link_login');
 
 $hadSession = isset($_SESSION['admin_authenticated']);
 $isLoggedIn = adminAuthenticated(); // 失効していれば、ここでセッションから取り除かれる
@@ -91,6 +93,28 @@ try {
                     $error = '指定されたIDは見つかりませんでした。';
                 }
                 break;
+
+            case 'child_link':
+                if (!$isLoggedIn) {
+                    throw new AppError('ログインしてください。', 'unauthenticated', 401);
+                }
+                if (!$linkEnabled) {
+                    throw new AppError('子機URLの発行は無効です。', 'link_disabled', 403);
+                }
+                $issuedLink = Doorbell::createChildLink(
+                    (string) ($_POST['doorbell_id'] ?? ''),
+                    (string) ($_POST['display_name'] ?? ''),
+                );
+                break;
+
+            case 'child_link_delete':
+                if (!$isLoggedIn) {
+                    throw new AppError('ログインしてください。', 'unauthenticated', 401);
+                }
+                if (!Doorbell::deleteChildLink((string) ($_POST['token'] ?? ''))) {
+                    $error = '指定された子機URLは見つかりませんでした。';
+                }
+                break;
         }
     }
 } catch (AppError $e) {
@@ -114,7 +138,7 @@ header('Cache-Control: no-store');
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
 <title>ID発行管理 - ドアベル</title>
-<link rel="stylesheet" href="assets/style.css?v=3">
+<link rel="stylesheet" href="assets/style.css?v=4">
 </head>
 <body>
 <div id="app" class="admin">
@@ -151,6 +175,22 @@ header('Cache-Control: no-store');
         </div>
       <?php endif; ?>
 
+      <?php if ($issuedLink !== null): ?>
+        <?php $linkUrl = Http::baseUrl() . 'index.php?child=' . $issuedLink['token']; ?>
+        <div class="credentials">
+          <p class="meta">
+            子機URLを発行しました（ID <?= Http::h(Doorbell::formatId($issuedLink['doorbell_id'])) ?> /
+            表示名 <?= Http::h($issuedLink['display_name']) ?>）。
+            このURLをブラウザのホームURLに設定すると、ログイン操作なしで子機になります。
+          </p>
+          <p class="link-url" id="issued-link"><?= Http::h($linkUrl) ?></p>
+          <button type="button" class="btn btn-quiet" data-copy="issued-link">URLをコピー</button>
+          <p class="warn-text">
+            ※ このURLを知っている人は誰でもこの子機として呼び出せます。取り扱いに注意してください。
+          </p>
+        </div>
+      <?php endif; ?>
+
       <?php if ($deleted !== ''): ?>
         <p class="meta">ID <?= Http::h($deleted) ?> を削除しました。</p>
       <?php endif; ?>
@@ -183,7 +223,10 @@ header('Cache-Control: no-store');
               <td><?= Http::h($row['created_ip']) ?></td>
               <td><?= $row['parents'] > 0 ? '稼働中' : '—' ?></td>
               <td><?= $row['children'] > 0 ? '稼働中' : '—' ?></td>
-              <td>
+              <td class="row-actions">
+                <?php if ($linkEnabled): ?>
+                  <button type="button" class="btn btn-quiet" data-link-id="<?= Http::h($row['doorbell_id']) ?>">子機URL</button>
+                <?php endif; ?>
                 <form method="post" onsubmit="return confirm('ID <?= Http::h($row['doorbell_id']) ?> を削除します。よろしいですか？');">
                   <input type="hidden" name="csrf_token" value="<?= Http::h($csrf) ?>">
                   <input type="hidden" name="action" value="delete">
@@ -199,6 +242,53 @@ header('Cache-Control: no-store');
 
       <p class="warn-text">※ パスワードはハッシュ化して保存されるため、発行時以外は確認できません。</p>
 
+      <?php $links = Doorbell::listChildLinks(); ?>
+      <?php if ($linkEnabled || $links !== []): ?>
+        <h2 class="section-title">子機URL</h2>
+        <?php if (!$linkEnabled): ?>
+          <p class="meta">
+            現在この機能は無効（<code>child_link_login</code> が false）です。以下のURLではログインできません。
+          </p>
+        <?php endif; ?>
+        <?php if ($links === []): ?>
+          <p class="meta">まだ子機URLはありません。発行済みIDの「子機URL」から作成できます。</p>
+        <?php else: ?>
+          <table>
+            <thead>
+              <tr>
+                <th>ID</th><th>表示名</th><th>発行日時</th><th>最終利用</th><th></th>
+              </tr>
+            </thead>
+            <tbody>
+            <?php foreach ($links as $link): ?>
+              <?php $url = Http::baseUrl() . 'index.php?child=' . $link['token']; ?>
+              <tr>
+                <td><?= Http::h($link['doorbellId']) ?></td>
+                <td><?= Http::h($link['displayName']) ?></td>
+                <td><?= Http::h($link['createdAt']) ?></td>
+                <td><?= Http::h($link['lastUsedAt']) ?></td>
+                <td class="row-actions">
+                  <button type="button" class="btn btn-quiet" data-copy="url-<?= Http::h($link['token']) ?>">コピー</button>
+                  <form method="post" onsubmit="return confirm('この子機URLを失効させます。よろしいですか？');">
+                    <input type="hidden" name="csrf_token" value="<?= Http::h($csrf) ?>">
+                    <input type="hidden" name="action" value="child_link_delete">
+                    <input type="hidden" name="token" value="<?= Http::h($link['token']) ?>">
+                    <button type="submit" class="btn btn-quiet">失効</button>
+                  </form>
+                </td>
+              </tr>
+              <tr>
+                <td colspan="5" class="link-url" id="url-<?= Http::h($link['token']) ?>"><?= Http::h($url) ?></td>
+              </tr>
+            <?php endforeach; ?>
+            </tbody>
+          </table>
+          <p class="warn-text">
+            ※ 子機URLはそれ自体がログイン情報です。URLを知っている人は誰でもこの子機として呼び出せます。
+          </p>
+        <?php endif; ?>
+      <?php endif; ?>
+
       <form method="post" style="margin-top:20px">
         <input type="hidden" name="csrf_token" value="<?= Http::h($csrf) ?>">
         <input type="hidden" name="action" value="logout">
@@ -207,5 +297,27 @@ header('Cache-Control: no-store');
     <?php endif; ?>
   </div>
 </div>
+
+<?php if ($isLoggedIn && $linkEnabled): ?>
+<dialog id="link-dialog" class="dialog">
+  <form method="post">
+    <h2 class="dialog-title">子機URLの発行</h2>
+    <p class="meta">ID <strong id="link-target"></strong> の子機URLを発行します。</p>
+    <input type="hidden" name="csrf_token" value="<?= Http::h($csrf) ?>">
+    <input type="hidden" name="action" value="child_link">
+    <input type="hidden" name="doorbell_id" id="link-doorbell-id" value="">
+    <label class="field">
+      <span class="field-label">子機の表示名</span>
+      <input type="text" name="display_name" id="link-name" maxlength="32" placeholder="玄関 / 受付 など" required>
+    </label>
+    <div class="dialog-actions">
+      <button type="button" class="btn" id="link-cancel">キャンセル</button>
+      <button type="submit" class="btn btn-primary">発行する</button>
+    </div>
+  </form>
+</dialog>
+<?php endif; ?>
+
+<script src="assets/admin.js?v=1"></script>
 </body>
 </html>

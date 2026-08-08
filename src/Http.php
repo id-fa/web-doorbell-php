@@ -78,6 +78,20 @@ final class Http
         return $dir === '' ? '/' : $dir . '/';
     }
 
+    /**
+     * 設置場所のベースURL（末尾スラッシュ付き）。
+     *
+     * ホスト名はリクエストヘッダ由来で偽装できるため、管理画面での表示以外に使わないこと。
+     */
+    public static function baseUrl(): string
+    {
+        $host = (string) ($_SERVER['HTTP_HOST'] ?? '');
+        // ホスト名として現れうる文字だけを残す（表示先に別のURLを混ぜ込ませない）
+        $host = preg_replace('/[^A-Za-z0-9.\-:\[\]]/', '', $host) ?? '';
+
+        return (self::isHttps() ? 'https' : 'http') . '://' . ($host === '' ? 'localhost' : $host) . self::basePath();
+    }
+
     /** クライアントIPアドレスを取得する */
     public static function clientIp(): string
     {

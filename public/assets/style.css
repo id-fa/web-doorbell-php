@@ -137,6 +137,7 @@ button:focus-visible {
 .btn:hover:not(:disabled) { filter: brightness(1.12); }
 .btn:active:not(:disabled) { transform: translateY(1px); }
 .btn:disabled { opacity: 0.55; cursor: default; }
+.btn[hidden] { display: none; }
 
 .btn-primary {
   background: var(--accent-strong);
@@ -650,6 +651,25 @@ button:focus-visible {
 
 .overlay-card .btn { margin-top: 16px; }
 
+/* ---------- ログアウト前のパスワード確認 ---------- */
+
+.overlay-card-ask {
+  border-color: var(--accent);
+  text-align: left;
+}
+
+.overlay-card-ask .overlay-title { color: var(--text); }
+
+.overlay-card-ask .field {
+  margin: 16px 0 0;
+}
+
+.overlay-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
 /* ---------- 管理画面 ---------- */
 
 .admin { max-width: 720px; }
@@ -709,6 +729,60 @@ button:focus-visible {
   font-size: 0.82rem;
   color: var(--alert);
 }
+
+/* 1行に複数のボタン／フォームを並べる（表の操作列） */
+.row-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  white-space: nowrap;
+}
+
+.row-actions form { display: inline; }
+
+/* 子機URL（長いので折り返して全体を見せる） */
+.link-url {
+  margin: 8px 0;
+  padding: 8px 10px;
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.8rem;
+  white-space: normal;
+  word-break: break-all;
+  user-select: all;
+}
+
+/* ---------- 管理画面のダイアログ ---------- */
+
+.dialog {
+  width: min(100%, 420px);
+  padding: 24px 22px;
+  color: var(--text);
+  background: var(--bg-card);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+}
+
+.dialog::backdrop {
+  background: rgb(15 23 42 / 70%);
+}
+
+.dialog-title {
+  margin: 0 0 10px;
+  font-size: 1.15rem;
+}
+
+.dialog-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  margin-top: 16px;
+}
+
+.dialog-actions .btn { margin-top: 0; }
 
 .meta {
   margin: 0 0 6px;

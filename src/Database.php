@@ -128,6 +128,20 @@ final class Database
         $pdo->exec('CREATE INDEX IF NOT EXISTS idx_calls_pending ON calls (doorbell_id, status, id)');
         $pdo->exec('CREATE INDEX IF NOT EXISTS idx_calls_device ON calls (device_id, id)');
 
+        // 子機の自動ログイン用URL（child_link_login が有効なときだけ使う）。
+        // トークンはそれ自体が認証情報なので、URLを知っている端末は誰でも子機になれる。
+        $pdo->exec(<<<'SQL'
+            CREATE TABLE IF NOT EXISTS child_links (
+                token        TEXT    PRIMARY KEY,
+                doorbell_id  TEXT    NOT NULL,
+                display_name TEXT    NOT NULL,
+                created_at   INTEGER NOT NULL,
+                last_used_at INTEGER NOT NULL DEFAULT 0,
+                FOREIGN KEY (doorbell_id) REFERENCES doorbell_ids (doorbell_id) ON DELETE CASCADE
+            )
+        SQL);
+        $pdo->exec('CREATE INDEX IF NOT EXISTS idx_child_links_id ON child_links (doorbell_id, created_at)');
+
         $pdo->exec(<<<'SQL'
             CREATE TABLE IF NOT EXISTS rate_limits (
                 bucket       TEXT    PRIMARY KEY,

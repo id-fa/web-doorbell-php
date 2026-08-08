@@ -28,6 +28,8 @@ final class Config
         'session_lifetime'       => 86400,
         'history_retention_days' => 30,
         'history_display_limit'  => 20,
+        'child_logout_password'  => true,
+        'child_link_login'       => false,
         'trust_proxy'            => false,
         'rate_limit'             => [
             'window'       => 60,
@@ -46,7 +48,7 @@ final class Config
             return self::$values;
         }
 
-        $file = \dirname(__DIR__) . '/config/config.php';
+        $file   = self::envOverride('DOORBELL_CONFIG_PATH') ?: \dirname(__DIR__) . '/config/config.php';
         $loaded = [];
         if (is_file($file)) {
             /** @var mixed $loaded */
@@ -60,15 +62,8 @@ final class Config
         $values['rate_limit'] = array_merge(self::DEFAULTS['rate_limit'], $loaded['rate_limit'] ?? []);
         $values['db_path'] ??= \dirname(__DIR__) . '/data/doorbell.sqlite';
 
-        // テスト実行時に本番データを壊さないよう、DBの場所を環境変数で差し替えられるようにする。
-        // Web サーバー経由（php-fpm / mod_php / CGI）では受け付けない。
-        // それらの SAPI では環境変数がリクエスト由来の値で汚染されうるため。
-        if (\in_array(PHP_SAPI, ['cli', 'cli-server'], true)) {
-            $dbPathOverride = getenv('DOORBELL_DB_PATH');
-            if (is_string($dbPathOverride) && $dbPathOverride !== '') {
-                $values['db_path'] = $dbPathOverride;
-            }
-        }
+        // テスト実行時に本番データを壊さないよう、DBの場所を環境変数で差し替えられるようにする
+        $values['db_path'] = self::envOverride('DOORBELL_DB_PATH') ?: $values['db_path'];
 
         // 極端な値で動作不能にならないよう最低限の丸め込みを行う
         $values['polling_interval']       = max(1, (int) $values['polling_interval']);
@@ -83,9 +78,28 @@ final class Config
         $values['parent_offline_polls']   = max(2, (int) $values['parent_offline_polls']);
         $values['offline_stop_seconds']   = max(60, (int) $values['offline_stop_seconds']);
         $values['child_status_window']    = max(60, (int) $values['child_status_window']);
+        $values['child_logout_password']  = (bool) $values['child_logout_password'];
+        $values['child_link_login']       = (bool) $values['child_link_login'];
 
         self::$values = $values;
         return self::$values;
+    }
+
+    /**
+     * テスト用の環境変数による上書き（設定ファイルの場所・DBの場所）。
+     *
+     * Web サーバー経由（php-fpm / mod_php / CGI）では受け付けない。
+     * それらの SAPI では環境変数がリクエスト由来の値で汚染されうるため。
+     */
+    private static function envOverride(string $name): string
+    {
+        if (!\in_array(PHP_SAPI, ['cli', 'cli-server'], true)) {
+            return '';
+        }
+
+        $value = getenv($name);
+
+        return is_string($value) ? $value : '';
     }
 
     public static function get(string $key, mixed $default = null): mixed
@@ -110,6 +124,7 @@ final class Config
             'absenceTimeout'      => self::int('absence_timeout'),
             'responseViewTimeout' => self::int('response_view_timeout'),
             'offlineStopSeconds'  => self::int('offline_stop_seconds'),
+            'childLogoutPassword' => (bool) self::get('child_logout_password'),
         ];
     }
 }

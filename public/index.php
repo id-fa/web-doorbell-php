@@ -12,8 +12,15 @@ require __DIR__ . '/../src/bootstrap.php';
 
 Http::startSession();
 
+// 子機URL（?child=トークン）でアクセスされたら、そのままログインを試みる。
+// 検証は api.php 側で行うため、ここでは形式だけ確認して渡す
+$childLink = Config::get('child_link_login')
+    ? Doorbell::normalizeToken((string) ($_GET['child'] ?? ''))
+    : '';
+
 $bootstrapData = [
     'csrfToken'       => Http::csrfToken(),
+    'childLink'       => $childLink,
     'config'          => Config::publicValues(),
     'responses'       => Doorbell::RESPONSES,
     'responseLabels'  => Doorbell::RESPONSE_LABELS,
@@ -33,7 +40,7 @@ header('Referrer-Policy: same-origin');
 <meta name="theme-color" content="#1f2937">
 <meta name="robots" content="noindex, nofollow">
 <title>ドアベル</title>
-<link rel="stylesheet" href="assets/style.css?v=3">
+<link rel="stylesheet" href="assets/style.css?v=5">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🔔</text></svg>">
 </head>
 <body>
@@ -125,7 +132,7 @@ header('Referrer-Policy: same-origin');
         <span class="badge badge-child">子機</span>
         <strong class="bar-name" id="child-name"></strong>
       </div>
-      <button type="button" class="btn btn-quiet" data-action="logout">ログアウト</button>
+      <button type="button" class="btn btn-quiet" id="child-logout" data-action="logout">ログアウト</button>
     </header>
 
     <div class="stage" id="child-idle">
@@ -158,6 +165,25 @@ header('Referrer-Policy: same-origin');
 
   <p class="error global-error" id="global-error" role="alert" hidden></p>
 
+  <!-- ログアウト前のパスワード確認（子機の誤操作・いたずら対策） -->
+  <div class="overlay" id="logout-confirm" role="dialog" aria-modal="true" aria-labelledby="logout-title" hidden>
+    <div class="overlay-card overlay-card-ask">
+      <h2 class="overlay-title" id="logout-title">ログアウト</h2>
+      <p class="overlay-text">この端末のパスワードを入力してください。</p>
+      <form id="logout-form" autocomplete="off" novalidate>
+        <label class="field">
+          <span class="field-label">パスワード</span>
+          <input type="password" id="logout-password" maxlength="64" autocomplete="off" required>
+        </label>
+        <p class="error" id="logout-error" role="alert" hidden></p>
+        <div class="overlay-actions">
+          <button type="button" class="btn" id="logout-cancel">キャンセル</button>
+          <button type="submit" class="btn btn-primary" id="logout-submit">ログアウト</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
   <!-- 長時間サーバーに接続できずポーリングを停止したときの表示 -->
   <div class="overlay" id="disconnected" role="alertdialog" aria-labelledby="disconnected-title" hidden>
     <div class="overlay-card">
@@ -174,6 +200,6 @@ header('Referrer-Policy: same-origin');
     $bootstrapData,
     JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT,
 ) ?></script>
-<script src="assets/app.js?v=3"></script>
+<script src="assets/app.js?v=5"></script>
 </body>
 </html>

@@ -26,6 +26,7 @@ php -S 127.0.0.1:8791 -t public
 # 構文チェックのみ
 for f in src/*.php public/*.php config/*.php tests/*.php; do php -l "$f"; done
 node --check public/assets/app.js
+node --check public/assets/admin.js
 
 # DB をリセット（スキーマは初回アクセス時に自動生成される）
 rm -f data/doorbell.sqlite data/doorbell.sqlite-shm data/doorbell.sqlite-wal
@@ -35,9 +36,11 @@ php -r "require 'src/bootstrap.php'; use Doorbell\Doorbell; print_r(Doorbell::is
 ```
 
 テストは一時ファイルの SQLite を使うため `data/` の実データを壊さない。
-DB の場所は環境変数 `DOORBELL_DB_PATH` で上書きできる（`Config::load()` が解釈する）。
-これは CLI と組み込みサーバー（SAPI が `cli` / `cli-server`）でのみ有効。
-php-fpm 等の本番 SAPI では無視されるので、テストからは今までどおり使える。
+DB の場所は環境変数 `DOORBELL_DB_PATH`、設定ファイルの場所は `DOORBELL_CONFIG_PATH` で
+上書きできる（`Config::load()` が解釈する）。これは CLI と組み込みサーバー
+（SAPI が `cli` / `cli-server`）でのみ有効。php-fpm 等の本番 SAPI では無視される。
+既定と違う設定での挙動を検証したいときは、`e2e_test.sh` の子機URLのブロックのように
+一時 config を書いて別ポートにサーバーを立てる。
 
 ブラウザで手動確認するときの注意:
 
@@ -61,7 +64,7 @@ php-fpm 等の本番 SAPI では無視されるので、テストからは今ま
 | --- | --- |
 | `public/index.php` | メイン画面の HTML シェルのみ。全画面（ログイン／親機／子機）の DOM を最初から出力し、切り替えは JS が行う |
 | `public/api.php` | 親機・子機の全操作。`action` で分岐する単一エンドポイント |
-| `public/admin.php` | ID 発行管理。ここだけ従来型のサーバーサイドレンダリング + POST |
+| `public/admin.php` | ID 発行管理・子機URLの発行。ここだけ従来型のサーバーサイドレンダリング + POST（`assets/admin.js` は操作の補助のみ） |
 
 `src/bootstrap.php` がオートローダを兼ねる（`Doorbell\` → `src/`）。
 `AppError` は `src/Http.php` に同居しているため bootstrap で先に読み込んでいる。
@@ -98,6 +101,15 @@ cron やバックグラウンドジョブは存在しない。以下はすべて
 - **1端末につき有効なセッションは1つ**。ログインのたびに `devices.session_key` を作り直し、
   `Doorbell::device()` がセッション側の値と照合する。`device_key` はクライアントが自由に選べるので、
   これがないと同じ値を送るだけで `max_children_per_id` / `max_parents_per_id` を回避できてしまう
+- **子機のログアウトはパスワード必須**（`child_logout_password`、既定 true）。無人の場所に置いた
+  子機を勝手にログアウトされないための仕様。`api.php` の `logout` が `Doorbell::verifyPassword()` で
+  検証し、クライアントは**成功応答を受け取るまでログイン画面へ戻さない**
+  （通信エラーで戻すと、回線を切るだけで確認をすり抜けられてしまう）
+- **子機URL**（`child_link_login`、既定 false）は `child_links` のトークンだけでログインする経路。
+  トークン＝ログイン情報なので、**設定が無効なら `api.php` も `index.php` もトークンを一切扱わない**。
+  ログイン後の処理は通常ログインと同じ `Doorbell::registerDevice()` を通す（上限・セッション鍵の扱いを揃えるため）。
+  クライアントはセッション切れ時に `relogin()` で自動的に入り直し（無人端末をログイン画面で止めない）、
+  子機画面のログアウトボタン（`#child-logout`）は非表示にする（開き直せば再ログインされるため意味がない）
 
 ### 呼び出しのライフサイクル
 

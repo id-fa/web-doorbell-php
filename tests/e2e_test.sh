@@ -19,9 +19,11 @@ WORK="$(mktemp -d)"
 PORT="${PORT:-8788}"
 BASE="${BASE_URL:-}"
 SERVER_PID=""
+LINK_PID=""
 
 cleanup() {
     [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null
+    [ -n "$LINK_PID" ] && kill "$LINK_PID" 2>/dev/null
     rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -201,11 +203,120 @@ OUT=$(api child.cookie "$CC" '{"action":"state"}')
 grep -q '"parentOnline":false' <<< "$OUT" && R=1 || R=0
 check "ログアウトで親機オフラインになる" "$R" "$OUT"
 
+echo "== 子機のログアウト =="
+# 置きっぱなしの子機を勝手にログアウトされないよう、パスワードを再確認する
+OUT=$(api child.cookie "$CC" '{"action":"logout"}')
+grep -q 'invalid_password' <<< "$OUT" && R=1 || R=0
+check "パスワードなしの子機ログアウトは拒否される" "$R" "$OUT"
+
+OUT=$(api child.cookie "$CC" '{"action":"logout","password":"wrong"}')
+grep -q 'invalid_password' <<< "$OUT" && R=1 || R=0
+check "誤ったパスワードの子機ログアウトは拒否される" "$R" "$OUT"
+
+OUT=$(api child.cookie "$CC" '{"action":"state"}')
+grep -q '"role":"child"' <<< "$OUT" && R=1 || R=0
+check "拒否された子機はログインしたまま" "$R" "$OUT"
+
 # 子機がログアウトすると親機の一覧から消える
-api child.cookie "$CC" '{"action":"logout"}' > /dev/null
+OUT=$(api child.cookie "$CC" "{\"action\":\"logout\",\"password\":\"$CPW\"}")
+grep -q '"ok":true' <<< "$OUT" && R=1 || R=0
+check "子機パスワードでログアウトできる" "$R" "$OUT"
 OUT=$(api parent.cookie "$PC" "{\"action\":\"login\",\"doorbell_id\":\"$DID\",\"password\":\"$PPW\",\"display_name\":\"$PARENT_NAME\",\"device_key\":\"aaaaaaaaaaaaaaaa\"}")
 grep -q '"children":\[\]' <<< "$OUT" && R=1 || R=0
 check "ログアウトした子機は親機の一覧から消える" "$R" "$OUT"
+
+echo "== 子機URL（自動ログイン） =="
+# 既定では無効。有効化した場合の動作は、別ポートに専用サーバーを立てて検証する
+BOGUS='00000000000000000000000000000000'
+OUT=$(api parent.cookie "$PC" "{\"action\":\"link_login\",\"token\":\"$BOGUS\"}")
+grep -q 'link_disabled' <<< "$OUT" && R=1 || R=0
+check "既定では子機URLログインが無効" "$R" "$OUT"
+
+if [ -n "$SERVER_PID" ]; then
+    cat > "$WORK/link_config.php" <<'PHP'
+<?php
+return ['child_link_login' => true];
+PHP
+    LPORT=$((PORT + 1))
+    DOORBELL_CONFIG_PATH="$WORK/link_config.php" \
+        php -S "127.0.0.1:$LPORT" -t "$ROOT/public" > "$WORK/link_server.log" 2>&1 &
+    LINK_PID=$!
+    LBASE="http://127.0.0.1:$LPORT"
+    for _ in $(seq 1 50); do
+        curl -s -o /dev/null "$LBASE/index.php" && break
+        sleep 0.2
+    done
+
+    # 管理画面から子機URLを発行する
+    curl -s -c "$WORK/l.cookie" -o "$WORK/l1.html" "$LBASE/admin.php"
+    LC=$(csrf_of "$WORK/l1.html")
+    curl -s -b "$WORK/l.cookie" -c "$WORK/l.cookie" -o "$WORK/l2.html" \
+         -d "csrf_token=$LC&action=login&password=1234" "$LBASE/admin.php"
+    LC=$(csrf_of "$WORK/l2.html")
+
+    grep -q 'data-link-id' "$WORK/l2.html" && R=1 || R=0
+    check "有効時は管理画面に子機URLボタンが出る" "$R" ""
+    grep -q 'data-link-id' "$WORK/a4.html" && R=0 || R=1
+    check "無効時は管理画面に子機URLボタンが出ない" "$R" ""
+
+    # 非ASCIIの表示名が化けないよう、ボディはファイル経由で渡す
+    printf 'csrf_token=%s&action=child_link&doorbell_id=%s&display_name=%s' "$LC" "$DID" '勝手口' \
+        > "$WORK/link_post.txt"
+    curl -s -b "$WORK/l.cookie" -c "$WORK/l.cookie" -o "$WORK/l3.html" \
+         -H 'Content-Type: application/x-www-form-urlencoded' \
+         --data-binary "@$WORK/link_post.txt" "$LBASE/admin.php"
+    TOKEN=$(grep -o 'index\.php?child=[0-9a-f]\{32\}' "$WORK/l3.html" | head -1 | grep -o '[0-9a-f]\{32\}')
+    [ -n "$TOKEN" ] && R=1 || R=0
+    check "管理画面から子機URLを発行できる" "$R" "$(grep -o 'class="error"[^<]*<[^<]*' "$WORK/l3.html")"
+
+    # 子機URLを開くと、トークンがブートストラップに載る
+    curl -s -c "$WORK/link.cookie" -o "$WORK/l4.html" "$LBASE/index.php?child=$TOKEN"
+    LKC=$(grep -o '"csrfToken":"[a-f0-9]*"' "$WORK/l4.html" | grep -o '[a-f0-9]\{64\}')
+    grep -q "\"childLink\":\"$TOKEN\"" "$WORK/l4.html" && R=1 || R=0
+    check "子機URLのトークンが画面に渡る" "$R" ""
+
+    curl -s -o "$WORK/l5.html" "$BASE/index.php?child=$TOKEN"
+    grep -q '"childLink":""' "$WORK/l5.html" && R=1 || R=0
+    check "無効なサーバーではトークンを渡さない" "$R" ""
+
+    lapi() { # $1=CSRFトークン $2=JSONボディ
+        printf '%s' "$2" > "$WORK/payload.json"
+        curl -s -b "$WORK/link.cookie" -c "$WORK/link.cookie" \
+             -H 'Content-Type: application/json' -H "X-CSRF-Token: $1" \
+             --data-binary "@$WORK/payload.json" "$LBASE/api.php"
+    }
+
+    OUT=$(lapi "$LKC" "{\"action\":\"link_login\",\"token\":\"$TOKEN\",\"device_key\":\"eeeeeeeeeeeeeeee\"}")
+    grep -q '"role":"child"' <<< "$OUT" && R=1 || R=0
+    check "子機URLだけでログインできる" "$R" "$OUT"
+    grep -q '"displayName":"勝手口"' <<< "$OUT" && R=1 || R=0
+    check "リンクの表示名が子機名になる" "$R" "$OUT"
+
+    OUT=$(lapi "$LKC" '{"action":"state"}')
+    grep -q '"role":"child"' <<< "$OUT" && R=1 || R=0
+    check "ログイン後は通常どおりポーリングできる" "$R" "$OUT"
+
+    OUT=$(lapi "$LKC" "{\"action\":\"link_login\",\"token\":\"$BOGUS\"}")
+    grep -q 'invalid_link' <<< "$OUT" && R=1 || R=0
+    check "存在しないトークンは拒否される" "$R" "$OUT"
+
+    # 失効させたトークンでは入れない
+    LC=$(csrf_of "$WORK/l3.html")
+    curl -s -b "$WORK/l.cookie" -c "$WORK/l.cookie" -o "$WORK/l6.html" \
+         -d "csrf_token=$LC&action=child_link_delete&token=$TOKEN" "$LBASE/admin.php"
+    OUT=$(lapi "$LKC" "{\"action\":\"link_login\",\"token\":\"$TOKEN\",\"device_key\":\"eeeeeeeeeeeeeeee\"}")
+    grep -q 'invalid_link' <<< "$OUT" && R=1 || R=0
+    check "失効させた子機URLでは入れない" "$R" "$OUT"
+
+    # 子機URLで入った端末も、ログアウトにはパスワードが必要（枠を解放して後続のテストへ戻す）
+    OUT=$(lapi "$LKC" '{"action":"logout"}')
+    grep -q 'invalid_password' <<< "$OUT" && R=1 || R=0
+    check "子機URLで入った端末もログアウトにパスワードが要る" "$R" "$OUT"
+    lapi "$LKC" "{\"action\":\"logout\",\"password\":\"$CPW\"}" > /dev/null
+
+    kill "$LINK_PID" 2>/dev/null
+    LINK_PID=""
+fi
 
 echo "== 端末キーの使い回しによる同時接続上限の回避 =="
 # device_key はクライアント由来なので、同じ値を送れば上限のカウントから外れてしまう。

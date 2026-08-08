@@ -43,13 +43,7 @@ try {
                 $ip,
             );
 
-            // セッション固定化攻撃を避けるため、ログイン成功時にIDを再生成する
-            $csrf = $_SESSION['csrf_token'];
-            session_regenerate_id(true);
-            $_SESSION['csrf_token']     = $csrf;
-            $_SESSION['device_id']      = (int) $device['id'];
-            $_SESSION['device_session'] = (string) $device['session_key'];
-
+            establishSession($device);
             Http::rateLimitRelease('login_device', $ip);
             Http::json([
                 'ok'        => true,
@@ -58,11 +52,56 @@ try {
             ]);
             // no break（json() は exit する）
 
-        case 'logout':
-            if (isset($_SESSION['device_id'])) {
-                Doorbell::logout((int) $_SESSION['device_id']);
-                unset($_SESSION['device_id'], $_SESSION['device_session']);
+        case 'link_login':
+            // 子機URL（トークン）だけでログインする。URLを知っていれば誰でも子機になれるため、
+            // 設定で明示的に有効にしたときだけ受け付ける
+            if (!Config::get('child_link_login')) {
+                throw new AppError('子機URLによるログインは無効です。', 'link_disabled', 403);
             }
+
+            Http::rateLimit('login_link', $ip, (int) $limits['max_logins']);
+
+            $device = Doorbell::loginByLink(
+                (string) ($input['token'] ?? ''),
+                (string) ($input['device_key'] ?? ''),
+                $ip,
+            );
+
+            establishSession($device);
+            Http::rateLimitRelease('login_link', $ip);
+            Http::json([
+                'ok'        => true,
+                'deviceKey' => (string) $device['device_key'],
+                'state'     => state($device),
+            ]);
+            // no break（json() は exit する）
+
+        case 'logout':
+            // セッションが既に無効なら（期限切れ・別ウィンドウでの再ログイン）、
+            // パスワードを求めずにログイン画面へ戻す
+            $device = Doorbell::device(
+                (int) ($_SESSION['device_id'] ?? 0),
+                (string) ($_SESSION['device_session'] ?? ''),
+            );
+
+            if ($device !== null) {
+                // 置きっぱなしの子機を勝手にログアウトされないよう、パスワードを再確認する
+                if (Doorbell::logoutNeedsPassword($device)) {
+                    // ログイン用のバケットとは分ける。共有すると、こちらの成功で
+                    // ログイン側の試行回数を巻き戻せてしまうため
+                    Http::rateLimit('logout_device', $ip, (int) $limits['max_logins']);
+
+                    if (!Doorbell::verifyPassword($device, (string) ($input['password'] ?? ''))) {
+                        throw new AppError('パスワードが正しくありません。', 'invalid_password', 403);
+                    }
+
+                    Http::rateLimitRelease('logout_device', $ip);
+                }
+
+                Doorbell::logout((int) $device['id']);
+            }
+
+            unset($_SESSION['device_id'], $_SESSION['device_session']);
             Http::json(['ok' => true]);
 
         case 'state':
@@ -97,6 +136,16 @@ try {
 } catch (\Throwable $e) {
     error_log('doorbell api error: ' . $e);
     Http::json(['ok' => false, 'code' => 'server_error', 'message' => 'サーバーエラーが発生しました。'], 500);
+}
+
+/** ログイン成功時にセッションを張り直す（セッション固定化攻撃を避けるためIDを再生成する） */
+function establishSession(array $device): void
+{
+    $csrf = $_SESSION['csrf_token'];
+    session_regenerate_id(true);
+    $_SESSION['csrf_token']     = $csrf;
+    $_SESSION['device_id']      = (int) $device['id'];
+    $_SESSION['device_session'] = (string) $device['session_key'];
 }
 
 /** ログイン済み端末を取得する（未ログイン、または同じ端末が別セッションでログインし直したならエラー） */

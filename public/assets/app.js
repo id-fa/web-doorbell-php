@@ -240,8 +240,18 @@
     }
   });
 
+  /* ------------------------------------------------------------------ */
+  /* ログアウト                                                         */
+  /* ------------------------------------------------------------------ */
+
   document.querySelectorAll('[data-action="logout"]').forEach((button) => {
     button.addEventListener('click', async () => {
+      // 子機は無人の場所に置くため、パスワードを確認してからログアウトする
+      if (app.role === 'child' && cfg.childLogoutPassword) {
+        openLogoutDialog();
+        return;
+      }
+
       stopPolling();
       Ringtone.stop();
       try { await api('logout'); } catch { /* 失敗してもログイン画面へ戻す */ }
@@ -249,9 +259,86 @@
     });
   });
 
+  function openLogoutDialog() {
+    $('logout-password').value = '';
+    $('logout-error').hidden = true;
+    show($('logout-confirm'), true);
+    $('logout-password').focus();
+  }
+
+  function closeLogoutDialog() {
+    show($('logout-confirm'), false);
+    $('logout-password').value = '';
+  }
+
+  $('logout-cancel').addEventListener('click', closeLogoutDialog);
+
+  $('logout-form').addEventListener('submit', async (event) => {
+    event.preventDefault();
+
+    const button = $('logout-submit');
+    const errorEl = $('logout-error');
+    errorEl.hidden = true;
+    button.disabled = true;
+
+    try {
+      // サーバーが受理したときだけログイン画面へ戻す。通信に失敗した時点で戻してしまうと、
+      // 回線を切るだけでパスワード確認をすり抜けられてしまうため
+      await api('logout', { password: $('logout-password').value });
+      closeLogoutDialog();
+      toLogin();
+    } catch (err) {
+      errorEl.textContent = err.message;
+      errorEl.hidden = false;
+      $('logout-password').select();
+    } finally {
+      button.disabled = false;
+    }
+  });
+
+  /* ------------------------------------------------------------------ */
+  /* 子機URLによる自動ログイン                                          */
+  /* ------------------------------------------------------------------ */
+
+  // 子機URLで運用している端末はログアウトさせない。
+  // ログイン情報を持たない人が触る前提の設置なので、戻せない操作を置かない
+  if (boot.childLink) show($('child-logout'), false);
+
+  /**
+   * 子機URL（?child=トークン）でログインする。
+   * URLが無ければ false を返す。トークンが無効ならエラーを投げる。
+   */
+  async function linkLogin() {
+    if (!boot.childLink) return false;
+
+    const data = await api('link_login', { token: boot.childLink, device_key: deviceKey() });
+    if (data.deviceKey) store(STORE.deviceKey, data.deviceKey);
+
+    app.dismissedCallId = 0;
+    app.knownCalls.clear();
+    app.parentNotice = '';
+    resetCards();
+
+    applyState(data.state);
+    startPolling();
+    return true;
+  }
+
+  /**
+   * セッションが切れたときの復帰。
+   * 子機URL運用ではログイン画面で止まると誰も操作できないため、自動で入り直す。
+   */
+  async function relogin(message) {
+    try {
+      if (await linkLogin()) return;
+    } catch { /* 自動ログインできなければ通常のログイン画面へ */ }
+    toLogin(message);
+  }
+
   function toLogin(message = '') {
     stopPolling();
     Ringtone.stop();
+    closeLogoutDialog();
     show($('disconnected'), false);
     app.offlineSince = null;
     app.role = null;
@@ -291,7 +378,8 @@
       applyState(data.state);
     } catch (err) {
       if (err.code === 'unauthenticated') {
-        toLogin('セッションが切れました。もう一度ログインしてください。');
+        stopPolling();
+        relogin('セッションが切れました。もう一度ログインしてください。');
       } else if (err.code === 'csrf') {
         location.reload();
       } else {
@@ -628,7 +716,7 @@
     } catch (err) {
       Ringtone.stop();
       showError(err.message);
-      if (err.code === 'unauthenticated') toLogin('セッションが切れました。もう一度ログインしてください。');
+      if (err.code === 'unauthenticated') relogin('セッションが切れました。もう一度ログインしてください。');
     } finally {
       button.disabled = false;
     }
@@ -782,8 +870,16 @@
         applyState(data.state);
         startPolling();
         return;
-      } catch { /* セッション切れ時はログイン画面へ */ }
+      } catch { /* セッション切れ時は子機URL、それも無ければログイン画面へ */ }
     }
+
+    try {
+      if (await linkLogin()) return;
+    } catch (err) {
+      toLogin(err.message);
+      return;
+    }
+
     toLogin();
   })();
 })();

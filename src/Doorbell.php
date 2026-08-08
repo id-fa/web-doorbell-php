@@ -196,6 +196,22 @@ final class Doorbell
             default => throw new AppError('IDまたはパスワードが正しくありません。', 'invalid_credentials'),
         };
 
+        return self::registerDevice($doorbellId, $role, $displayName, $deviceKey, $ip);
+    }
+
+    /**
+     * 端末レコードを作成/更新してセッション鍵を発行する（ログイン後の共通処理）。
+     *
+     * @return array 端末レコード
+     */
+    private static function registerDevice(
+        string $doorbellId,
+        string $role,
+        string $displayName,
+        string $deviceKey,
+        string $ip,
+    ): array {
+        $pdo    = Database::pdo();
         $now    = time();
         $active = $now - self::activeWindow();
 
@@ -263,6 +279,115 @@ final class Doorbell
         return $device;
     }
 
+    // ------------------------------------------------------------------
+    // 子機の自動ログイン用URL
+    // ------------------------------------------------------------------
+
+    /**
+     * 子機URLでログインする（ID・パスワードの入力なし）。
+     *
+     * トークンを知っていれば誰でも子機になれる。設定 `child_link_login` で有効にした場合のみ使う。
+     *
+     * @return array 端末レコード
+     */
+    public static function loginByLink(string $token, string $deviceKeyInput, string $ip): array
+    {
+        $link = self::childLink($token);
+        if ($link === null) {
+            throw new AppError('この子機URLは使用できません。', 'invalid_link', 403);
+        }
+
+        $device = self::registerDevice(
+            (string) $link['doorbell_id'],
+            'child',
+            (string) $link['display_name'],
+            self::normalizeDeviceKey($deviceKeyInput),
+            $ip,
+        );
+
+        Database::pdo()
+            ->prepare('UPDATE child_links SET last_used_at = :now WHERE token = :token')
+            ->execute([':now' => time(), ':token' => (string) $link['token']]);
+
+        return $device;
+    }
+
+    /** 子機URLを発行する（表示名はリンクに固定される） */
+    public static function createChildLink(string $doorbellIdInput, string $displayName): array
+    {
+        $doorbellId  = self::normalizeId($doorbellIdInput);
+        $displayName = self::normalizeDisplayName($displayName);
+
+        if ($displayName === '') {
+            throw new AppError('子機の表示名を入力してください。', 'invalid_input');
+        }
+
+        $stmt = Database::pdo()->prepare('SELECT 1 FROM doorbell_ids WHERE doorbell_id = :id');
+        $stmt->execute([':id' => $doorbellId]);
+        if ($stmt->fetchColumn() === false) {
+            throw new AppError('指定されたIDは見つかりませんでした。', 'unknown_id', 404);
+        }
+
+        $token = bin2hex(random_bytes(16));
+        Database::pdo()->prepare(<<<'SQL'
+            INSERT INTO child_links (token, doorbell_id, display_name, created_at)
+            VALUES (:token, :id, :name, :now)
+        SQL)->execute([
+            ':token' => $token,
+            ':id'    => $doorbellId,
+            ':name'  => $displayName,
+            ':now'   => time(),
+        ]);
+
+        return ['token' => $token, 'doorbell_id' => $doorbellId, 'display_name' => $displayName];
+    }
+
+    /** 発行済みの子機URL一覧（管理画面用） */
+    public static function listChildLinks(): array
+    {
+        $rows = Database::pdo()
+            ->query('SELECT * FROM child_links ORDER BY doorbell_id ASC, created_at ASC')
+            ->fetchAll();
+
+        return array_map(static fn (array $row): array => [
+            'token'       => (string) $row['token'],
+            'doorbellId'  => self::formatId((string) $row['doorbell_id']),
+            'displayName' => (string) $row['display_name'],
+            'createdAt'   => date('Y-m-d H:i', (int) $row['created_at']),
+            'lastUsedAt'  => (int) $row['last_used_at'] > 0 ? date('Y-m-d H:i', (int) $row['last_used_at']) : '—',
+        ], $rows);
+    }
+
+    /** 子機URLを失効させる */
+    public static function deleteChildLink(string $token): bool
+    {
+        $stmt = Database::pdo()->prepare('DELETE FROM child_links WHERE token = :token');
+        $stmt->execute([':token' => self::normalizeToken($token)]);
+
+        return $stmt->rowCount() > 0;
+    }
+
+    /** トークンから子機URLのレコードを取得する */
+    private static function childLink(string $token): ?array
+    {
+        $token = self::normalizeToken($token);
+        if ($token === '') {
+            return null;
+        }
+
+        $stmt = Database::pdo()->prepare('SELECT * FROM child_links WHERE token = :token');
+        $stmt->execute([':token' => $token]);
+        $link = $stmt->fetch();
+
+        return $link === false ? null : $link;
+    }
+
+    /** 子機URLのトークン（16進32桁）。形式が違えば空文字を返す */
+    public static function normalizeToken(string $token): string
+    {
+        return preg_match('/\A[0-9a-f]{32}\z/', $token) === 1 ? $token : '';
+    }
+
     /**
      * セッションに保存された端末IDから端末レコードを取得する。
      *
@@ -295,6 +420,41 @@ final class Doorbell
         Database::pdo()
             ->prepare('UPDATE devices SET last_seen_at = :now, ip = :ip WHERE id = :id')
             ->execute([':now' => time(), ':ip' => $ip, ':id' => $deviceId]);
+    }
+
+    /**
+     * ログアウトにパスワードの再入力が必要か。
+     *
+     * 子機は無人の場所に置きっぱなしにするため、通りすがりに触られてログアウトされると
+     * 呼び出せない状態のまま気づけない。親機は人がいる場所で使うので対象外。
+     */
+    public static function logoutNeedsPassword(array $device): bool
+    {
+        return (string) $device['role'] === 'child' && (bool) Config::get('child_logout_password');
+    }
+
+    /** 端末の役割に対応するパスワード（親機用／子機用）を検証する */
+    public static function verifyPassword(array $device, string $password): bool
+    {
+        if ($password === '') {
+            return false;
+        }
+
+        $stmt = Database::pdo()->prepare(<<<'SQL'
+            SELECT parent_password_hash, child_password_hash FROM doorbell_ids WHERE doorbell_id = :id
+        SQL);
+        $stmt->execute([':id' => (string) $device['doorbell_id']]);
+        $record = $stmt->fetch();
+
+        if ($record === false) {
+            return false;
+        }
+
+        $hash = (string) $device['role'] === 'parent'
+            ? (string) $record['parent_password_hash']
+            : (string) $record['child_password_hash'];
+
+        return password_verify($password, $hash);
     }
 
     /** ログアウト（枠をすぐ解放するため last_seen_at を過去にする） */

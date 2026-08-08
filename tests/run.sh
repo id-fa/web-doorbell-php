@@ -13,7 +13,9 @@ for file in "$ROOT"/src/*.php "$ROOT"/public/*.php "$ROOT"/config/*.php "$ROOT"/
     php -l "$file" > /dev/null || status=1
 done
 if command -v node > /dev/null 2>&1; then
-    node --check "$ROOT/public/assets/app.js" || status=1
+    for file in "$ROOT"/public/assets/*.js; do
+        node --check "$file" || status=1
+    done
 fi
 [ "$status" -eq 0 ] && echo "  OK   構文エラーなし"
 

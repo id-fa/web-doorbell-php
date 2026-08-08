@@ -1,0 +1,29 @@
+# ドキュメントルートを public/ に変更できないレンタルサーバー等で使う保険。
+#
+# 本来は Apache / nginx のドキュメントルートを public/ に設定するのが正しい構成です。
+# それができない場合のみ、このファイルをそのまま置いてください
+# （config / data / src / tests へのアクセスを遮断し、リクエストを public/ に転送します）。
+
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+
+    # 設定ファイル・データベース・ソース・テストへの直接アクセスを拒否
+    RewriteRule ^(config|data|src|tests)/ - [F,L]
+
+    # ルート直下のドキュメント類も公開しない
+    RewriteRule ^[^/]+\.(md|txt)$ - [F,L]
+
+    # すでに public/ 配下へのリクエストはそのまま通す
+    RewriteCond %{REQUEST_URI} !^/public/
+    RewriteRule ^(.*)$ public/$1 [L]
+</IfModule>
+
+<Files "*.sqlite*">
+    <IfModule mod_authz_core.c>
+        Require all denied
+    </IfModule>
+    <IfModule !mod_authz_core.c>
+        Order allow,deny
+        Deny from all
+    </IfModule>
+</Files>

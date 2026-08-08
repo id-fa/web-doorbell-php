@@ -1,0 +1,7 @@
+# 実際の設定ファイル（パスワードを含むため）
+/config/config.php
+
+# SQLite データベース
+/data/*.sqlite
+/data/*.sqlite-shm
+/data/*.sqlite-wal

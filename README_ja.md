@@ -129,7 +129,10 @@ server {
 - 応答待ちの間に何度コールボタンを押しても呼び出しは 1 件にまとめられ、
   履歴では同じ子機からの連続した「応答なし」もまとめて表示されます。
 
-![子機](docs/screenshot_client1.webp) ![親機](docs/screenshot_monitor_calling1.webp)
+|子機|親機|
+|--|--|
+|![子機](docs/screenshot_client1.webp)| ![親機](docs/screenshot_monitor_calling1.webp)|
+
 
 ### 応答履歴
 

@@ -22,6 +22,7 @@ final class Config
         ],
         'admin_password'         => '1234',
         'admin_session_lifetime' => 1800,
+        'admin_script'           => '',
         'max_ids_per_instance'   => 100,
         'max_children_per_id'    => 1,
         'max_parents_per_id'     => 1,
@@ -98,6 +99,7 @@ final class Config
         $values['child_link_login']       = (bool) $values['child_link_login'];
         $values['integration_api']        = (bool) $values['integration_api'];
         $values['responses']              = self::normalizeResponses($values['responses']);
+        $values['admin_script']           = self::normalizeAdminScript($values['admin_script']);
         $values['mask_secrets']           = (bool) $values['mask_secrets'];
         $values['mask_client_ip']         = (bool) $values['mask_client_ip'];
         $values['deletion_grace_seconds'] = max(0, (int) $values['deletion_grace_seconds']);
@@ -161,6 +163,29 @@ final class Config
         }
 
         return $result === [] ? self::DEFAULTS['responses'] : $result;
+    }
+
+    /**
+     * ID発行画面のファイル名を整える。
+     *
+     * この値は画面内のリンクとフォームの送信先にそのまま出るため、
+     * ディレクトリを含む指定は名前だけに落とし、ファイル名として使える文字に限る。
+     * 使えない指定は空（＝実行中のファイル名から自動判定）に戻す。
+     * 設定ミスで画面内のリンクが全滅するのを避けるため。
+     */
+    private static function normalizeAdminScript(mixed $raw): string
+    {
+        $name = basename(trim((string) $raw));
+        if ($name === '') {
+            return '';
+        }
+
+        if (preg_match('/\A[A-Za-z0-9][A-Za-z0-9._-]{0,63}\.php\z/', $name) !== 1) {
+            error_log('doorbell config: admin_script は英数字と . _ - からなる .php のファイル名で指定してください。自動判定に戻します。');
+            return '';
+        }
+
+        return $name;
     }
 
     /**

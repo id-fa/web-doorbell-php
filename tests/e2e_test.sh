@@ -22,12 +22,16 @@ SERVER_PID=""
 LINK_PID=""
 DEMO_PID=""
 RESP_PID=""
+NAME_PID=""
+RENAMED="" # 管理画面のリネーム検証で public/ に一時的に置くコピー
 
 cleanup() {
     [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null
     [ -n "$LINK_PID" ] && kill "$LINK_PID" 2>/dev/null
     [ -n "$DEMO_PID" ] && kill "$DEMO_PID" 2>/dev/null
     [ -n "$RESP_PID" ] && kill "$RESP_PID" 2>/dev/null
+    [ -n "$NAME_PID" ] && kill "$NAME_PID" 2>/dev/null
+    [ -n "$RENAMED" ] && rm -f "$ROOT/public/$RENAMED"
     rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -608,6 +612,58 @@ PHP
 
     kill "$RESP_PID" 2>/dev/null
     RESP_PID=""
+fi
+
+if [ -n "$SERVER_PID" ]; then
+    echo "== ID発行画面のリネーム =="
+    # 総当たりで見つけられにくくするため admin.php を別名にしても、画面内のリンクが壊れないこと。
+    # 実ファイルのコピーを public/ に一時的に置いて検証する（cleanup で必ず消す）
+    RENAMED="admin.e2e-renamed.php"
+    cp "$ROOT/public/admin.php" "$ROOT/public/$RENAMED"
+    RAWID=$(echo "$DID" | tr -d '-')
+
+    # 設定なしでも、開いているファイル名に追従する
+    curl -s -c "$WORK/n1.cookie" -o "$WORK/n1.html" "$BASE/$RENAMED"
+    NC=$(csrf_of "$WORK/n1.html")
+    curl -s -b "$WORK/n1.cookie" -c "$WORK/n1.cookie" -o "$WORK/n2.html" \
+         -d "csrf_token=$NC&action=login&password=1234" "$BASE/$RENAMED"
+    grep -q "$RENAMED?id=$RAWID" "$WORK/n2.html" && R=1 || R=0
+    check "リネームすると一覧のリンクが新しい名前になる" "$R" ""
+    grep -q 'admin\.php?id=' "$WORK/n2.html" && R=0 || R=1
+    check "元のファイル名はリンクに残らない" "$R" ""
+
+    # 設定 admin_script があれば、開いているファイル名より優先される
+    cat > "$WORK/name_config.php" <<PHP
+<?php
+return ['admin_script' => '$RENAMED'];
+PHP
+    NPORT=$((PORT + 4))
+    DOORBELL_CONFIG_PATH="$WORK/name_config.php" \
+        php -S "127.0.0.1:$NPORT" -t "$ROOT/public" > "$WORK/name_server.log" 2>&1 &
+    NAME_PID=$!
+    NBASE="http://127.0.0.1:$NPORT"
+    for _ in $(seq 1 50); do
+        curl -s -o /dev/null "$NBASE/index.php" && break
+        sleep 0.2
+    done
+
+    curl -s -c "$WORK/n3.cookie" -o "$WORK/n3.html" "$NBASE/admin.php"
+    NC=$(csrf_of "$WORK/n3.html")
+    curl -s -b "$WORK/n3.cookie" -c "$WORK/n3.cookie" -o "$WORK/n4.html" \
+         -d "csrf_token=$NC&action=login&password=1234" "$NBASE/admin.php"
+    grep -q "$RENAMED?id=$RAWID" "$WORK/n4.html" && R=1 || R=0
+    check "設定した名前が画面内のリンクに使われる" "$R" ""
+
+    # 設定とファイル名がずれていたら（＝設定した名前が存在しなければ）自動判定に戻す。
+    # リンクが全滅して詳細画面へ入れなくなるのを避けるため
+    rm -f "$ROOT/public/$RENAMED"
+    RENAMED=""
+    curl -s -b "$WORK/n3.cookie" -c "$WORK/n3.cookie" -o "$WORK/n5.html" "$NBASE/admin.php"
+    grep -q "admin\.php?id=$RAWID" "$WORK/n5.html" && R=1 || R=0
+    check "設定した名前のファイルがなければ自動判定に戻す" "$R" ""
+
+    kill "$NAME_PID" 2>/dev/null
+    NAME_PID=""
 fi
 
 echo "== 端末キーの使い回しによる同時接続上限の回避 =="

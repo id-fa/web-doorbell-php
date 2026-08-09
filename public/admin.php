@@ -38,10 +38,38 @@ function adminAuthenticated(): bool
     return true;
 }
 
+/**
+ * この画面自身のファイル名。画面内のリンクとフォームの送信先に使う。
+ *
+ * セキュリティ目的でこのファイルをリネームしても画面が壊れないよう、
+ * 設定 `admin_script` があればそれを、なければ実行中のファイル名を使う。
+ * 設定が実在しないファイルを指しているときは自動判定に落とす
+ * （リネームと設定がずれたまま、全リンクが 404 になるのを避けるため）。
+ */
+function selfScript(): string
+{
+    static $name = null;
+    if ($name !== null) {
+        return $name;
+    }
+
+    $configured = (string) Config::get('admin_script');
+    if ($configured !== '') {
+        if (is_file(__DIR__ . '/' . $configured)) {
+            return $name = $configured;
+        }
+        error_log('doorbell config: admin_script のファイル ' . $configured . ' が見つかりません。自動判定に切り替えます。');
+    }
+
+    $script = basename((string) ($_SERVER['SCRIPT_NAME'] ?? ''));
+
+    return $name = $script === '' ? 'admin.php' : $script;
+}
+
 /** 詳細画面のURL（フォームの送信先にも使う） */
 function detailUrl(string $rawId): string
 {
-    return 'admin.php?id=' . rawurlencode($rawId);
+    return selfScript() . '?id=' . rawurlencode($rawId);
 }
 
 /** 失効ボタンの状態（発行直後は押せない） */
@@ -172,7 +200,7 @@ if ($isLoggedIn && $viewId !== '' && $detail === null && $error === '') {
 }
 
 $csrf     = Http::csrfToken();
-$formUrl  = $detail === null ? 'admin.php' : detailUrl($detail['raw_id']);
+$formUrl  = $detail === null ? selfScript() : detailUrl($detail['raw_id']);
 
 header('X-Content-Type-Options: nosniff');
 header('X-Frame-Options: DENY');
@@ -299,7 +327,7 @@ header('Cache-Control: no-store');
 
     <?php else: ?>
       <?php /* ---------------- 詳細画面 ---------------- */ ?>
-      <p class="meta"><a href="admin.php">← 発行済みIDの一覧へ</a></p>
+      <p class="meta"><a href="<?= Http::h(selfScript()) ?>">← 発行済みIDの一覧へ</a></p>
       <h1 class="title">ID <?= Http::h($detail['doorbell_id']) ?></h1>
 
       <?php if ($error !== ''): ?>
@@ -501,7 +529,7 @@ header('Cache-Control: no-store');
         端末・応答履歴・子機URL・外部連携もすべて削除されます。元に戻せません。
       </p>
       <?php $deleteNote = lockNote($detail['locked_for']); ?>
-      <form method="post" action="admin.php"
+      <form method="post" action="<?= Http::h(selfScript()) ?>"
             onsubmit="return confirm('ID <?= Http::h($detail['doorbell_id']) ?> を削除します。よろしいですか？');">
         <input type="hidden" name="csrf_token" value="<?= Http::h($csrf) ?>">
         <input type="hidden" name="action" value="delete">

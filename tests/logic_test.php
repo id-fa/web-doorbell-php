@@ -517,6 +517,33 @@ check('残りのキーは使える', ($reserved['messages']['ok'] ?? '') === '�
 $tooMany = $responsesOf(['a' => 'A', 'b' => 'B', 'c' => 'C', 'd' => 'D']);
 check('上限（3件）を超えた分は使わない', count($tooMany['messages'] ?? []) === Config::MAX_RESPONSES, json_encode($tooMany['messages'] ?? null, JSON_UNESCAPED_UNICODE));
 
+echo "== ID発行画面のファイル名 ==\n";
+// 画面内のリンクにそのまま出る値なので、ファイル名として使えない指定は空（自動判定）に戻す
+$adminScriptOf = static function (mixed $value) use ($testConfig): string {
+    $reset = static function (string $path): void {
+        putenv('DOORBELL_CONFIG_PATH=' . $path);
+        (new ReflectionProperty(Config::class, 'values'))->setValue(null, null);
+    };
+
+    $file = sys_get_temp_dir() . '/doorbell-script-' . getmypid() . '.php';
+    file_put_contents($file, "<?php\nreturn " . var_export(['admin_script' => $value], true) . ";\n");
+
+    $reset($file);
+    $result = (string) Config::get('admin_script');
+
+    $reset($testConfig); // 以降のテストは元の設定で動かす
+    @unlink($file);
+
+    return $result;
+};
+
+check('既定では空（開いているファイル名に追従する）', (string) Config::get('admin_script') === '');
+check('別名のファイル名を設定できる', $adminScriptOf('admin.rraandoooom.php') === 'admin.rraandoooom.php');
+check('前後の空白は落とす', $adminScriptOf("  secret-admin.php\n") === 'secret-admin.php');
+check('ディレクトリを含む指定は名前だけにする', $adminScriptOf('../../etc/admin.php') === 'admin.php');
+check('.php 以外の拡張子は受け付けない', $adminScriptOf('admin.html') === '');
+check('URLやHTMLになりうる文字は受け付けない', $adminScriptOf('admin.php?x=1"><script>') === '');
+
 // 設定にないキーでは応答できない（クライアントから任意のキーを送らせない）
 $respId    = Doorbell::issueId('198.51.100.40');
 $respChild = Doorbell::login($respId['doorbell_id'], $respId['child_password'], '通用門', str_repeat('7', 16), '198.51.100.41');

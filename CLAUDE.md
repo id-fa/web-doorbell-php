@@ -159,6 +159,10 @@ WHERE created_at <= :deadline
 
 - `AppError` のエラー種別プロパティは `errorCode`。`code` は `Exception::$code` と衝突して致命的エラーになる
 - `public/assets/*` を編集したら `index.php` / `admin.php` の `?v=N` を上げる
+- **管理画面のファイル名はリネームできる**（設置者が総当たりを避けるため）。`admin.php` 内で
+  自分自身を指すURLを書くときは、必ず `selfScript()` を通すこと。`'admin.php'` とリテラルで
+  書くとリネーム後に 404 になる。名前は設定 `admin_script` があればそれ、無ければ
+  `basename($_SERVER['SCRIPT_NAME'])` で決まる（設定が実在しないファイルを指すときも自動判定に戻す）
 - `api.php` は POST + `X-CSRF-Token` ヘッダ必須。CSRF トークンは `index.php` が
   `#bootstrap-data` の JSON で渡す
 - **応答ボタンは設定 `responses` で決まる**（既定は `in1` / `in5` / `away` の3件）。

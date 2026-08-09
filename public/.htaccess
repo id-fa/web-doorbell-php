@@ -1,0 +1,15 @@
+# Authorization ヘッダを PHP に渡す。
+#
+# CGI / FastCGI で動く Apache は、既定では Authorization ヘッダを PHP に渡さない。
+# 外部連携API（integration.php）の Bearer トークンが読めなくなるため、環境変数に写す。
+# （このファイルがなくても、トークンをリクエストボディの token で送れば動作する）
+
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+    RewriteCond %{HTTP:Authorization} .
+    RewriteRule .* - [E=HTTP_AUTHORIZATION:%{HTTP:Authorization}]
+</IfModule>
+
+<IfModule mod_setenvif.c>
+    SetEnvIf Authorization "(.*)" HTTP_AUTHORIZATION=$1
+</IfModule>

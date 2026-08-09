@@ -9,11 +9,23 @@
 
 declare(strict_types=1);
 
-// bootstrap より前に DB の場所を差し替える
+// bootstrap より前に DB と設定の場所を差し替える
 $testDb = sys_get_temp_dir() . '/doorbell-test-' . getmypid() . '.sqlite';
 putenv('DOORBELL_DB_PATH=' . $testDb);
-register_shutdown_function(static function () use ($testDb): void {
-    foreach ([$testDb, $testDb . '-wal', $testDb . '-shm'] as $file) {
+
+// 既定値のまま検証したいので、設置環境の config.php ではなく最小限の一時設定を使う。
+// 外部連携は既定で無効なため、ここだけ有効にする（通知先には届かないアドレスを使う）
+$testConfig = sys_get_temp_dir() . '/doorbell-test-config-' . getmypid() . '.php';
+file_put_contents($testConfig, "<?php\nreturn " . var_export([
+    'integration_api'       => true,
+    'webhook_allowed_hosts' => ['hooks.slack.com', '127.0.0.1'],
+    'webhook_timeout'       => 1,
+    'webhook_max_attempts'  => 3,
+], true) . ";\n");
+putenv('DOORBELL_CONFIG_PATH=' . $testConfig);
+
+register_shutdown_function(static function () use ($testDb, $testConfig): void {
+    foreach ([$testDb, $testDb . '-wal', $testDb . '-shm', $testConfig] as $file) {
         if (is_file($file)) {
             @unlink($file);
         }
@@ -26,6 +38,9 @@ use Doorbell\AppError;
 use Doorbell\Config;
 use Doorbell\Database;
 use Doorbell\Doorbell;
+use Doorbell\Http;
+use Doorbell\Integration;
+use Doorbell\Webhook;
 
 $pass = 0;
 $fail = 0;
@@ -339,6 +354,143 @@ try {
 $link2 = Doorbell::createChildLink($linkId['doorbell_id'], '裏口');
 Doorbell::deleteId($linkId['doorbell_id']);
 check('ID削除でリンクも消える', Doorbell::deleteChildLink($link2['token']) === false);
+
+echo "== 外部連携（通知先URLの検証） ==\n";
+check('通知先なしは許可される', Integration::normalizeWebhookUrl('') === '');
+foreach (
+    [
+        'http:// の通知先は拒否される'         => 'http://hooks.slack.com/services/x',
+        '許可リスト外のホストは拒否される'      => 'https://example.com/hook',
+        'ユーザー情報つきのURLは拒否される'     => 'https://a:b@hooks.slack.com/x',
+    ] as $label => $url
+) {
+    try {
+        Integration::normalizeWebhookUrl($url);
+        check($label, false, '例外が発生しなかった');
+    } catch (AppError $e) {
+        check($label, $e->errorCode === 'invalid_webhook', $e->getMessage());
+    }
+}
+
+echo "== 外部連携（発行と認証） ==\n";
+$hookIds = Doorbell::issueId('198.51.100.30');
+$hookDid = $hookIds['doorbell_id'];
+$hook    = Integration::create($hookDid, '  Slack受付  ', 'https://127.0.0.1/doorbell-hook');
+
+check('トークンが発行される', preg_match('/\Adbi_[0-9a-f]{48}\z/', $hook['token']) === 1, $hook['token']);
+check('署名シークレットが発行される', strlen($hook['secret']) === 64);
+check('名前は前後の空白を落として保持する', $hook['label'] === 'Slack受付', $hook['label']);
+check('トークンは平文で保存されない', $pdo->query('SELECT COUNT(*) FROM integrations WHERE token_hash = ' . $pdo->quote($hook['token']))->fetchColumn() === 0);
+check('トークンで認証できる', (Integration::authenticate($hook['token'])['doorbell_id'] ?? '') === $hookDid);
+check('別のトークンでは認証できない', Integration::authenticate('dbi_' . str_repeat('0', 48)) === null);
+check('形式の違うトークンでは認証できない', Integration::authenticate('not-a-token') === null);
+
+// 存在しないIDには発行できない
+try {
+    Integration::create('00000000', 'x', '');
+    check('存在しないIDには発行できない', false, '例外が発生しなかった');
+} catch (AppError $e) {
+    check('存在しないIDには発行できない', $e->errorCode === 'unknown_id', $e->getMessage());
+}
+
+echo "== 外部連携（状態取得と応答） ==\n";
+$hookChild = Doorbell::login($hookDid, $hookIds['child_password'], '通用口', str_repeat('1', 16), '198.51.100.31');
+
+// 連携があれば外部から応答できるので、親機がポーリングしていなくてもオフライン表示にしない
+check('連携があると親機なしでもオンライン扱い', Doorbell::childState($hookChild)['parentOnline'] === true);
+
+Doorbell::call($hookChild);
+$ms = Doorbell::monitorState($hookDid, 'Slack受付', 'integration');
+check('連携から応答待ちが見える', ($ms['activeCalls'][0]['childName'] ?? '') === '通用口', json_encode($ms['activeCalls'], JSON_UNESCAPED_UNICODE));
+
+$devicesBefore = (int) $pdo->query('SELECT COUNT(*) FROM devices')->fetchColumn();
+Doorbell::respondBy($hookDid, '山田(Slack)', (int) $ms['activeCalls'][0]['id'], 'in1');
+$cs = Doorbell::childState($hookChild);
+check('連携からの応答が子機に届く', ($cs['currentCall']['responder'] ?? '') === '山田(Slack)', json_encode($cs['currentCall'], JSON_UNESCAPED_UNICODE));
+check('応答メッセージはサーバー定義のものになる', ($cs['currentCall']['message'] ?? '') === Doorbell::RESPONSES['in1']);
+check(
+    '連携からの応答では端末が増えない',
+    (int) $pdo->query('SELECT COUNT(*) FROM devices')->fetchColumn() === $devicesBefore,
+);
+
+echo "== 外部連携（通知の送信待ち） ==\n";
+$queued = static fn (): int => (int) $pdo->query('SELECT COUNT(*) FROM webhook_events')->fetchColumn();
+check('呼び出しと応答が送信待ちに積まれる', $queued() === 2, (string) $queued());
+
+// 不在確定も通知する（ポーリング時に評価されるため、誰かがアクセスした時点で積まれる）
+Doorbell::call($hookChild);
+$pdo->exec('UPDATE calls SET created_at = created_at - ' . ($timeout + 10) . " WHERE status = 'waiting'");
+Doorbell::expireStaleCalls($hookDid);
+check('不在確定も送信待ちに積まれる', $queued() === 4, (string) $queued());
+
+$stored = $pdo->query('SELECT event, payload FROM webhook_events ORDER BY id DESC LIMIT 1')->fetch();
+$payload = json_decode((string) $stored['payload'], true);
+check('最後の通知は不在確定', (string) $stored['event'] === 'no_answer');
+check('通知にIDと呼び出し内容が入る', ($payload['doorbellId'] ?? '') === Doorbell::formatId($hookDid)
+    && ($payload['call']['childName'] ?? '') === '通用口'
+    && ($payload['call']['status'] ?? '') === 'no_answer', (string) $stored['payload']);
+
+// Slack の Incoming Webhook に直接指定できるよう、本文になる text を必ず入れる
+$texts = array_map(
+    static fn (array $row): string => (string) (json_decode((string) $row['payload'], true)['text'] ?? ''),
+    $pdo->query('SELECT payload FROM webhook_events ORDER BY id')->fetchAll(),
+);
+check('すべての通知に本文が入る', $texts !== [] && !in_array('', $texts, true), json_encode($texts, JSON_UNESCAPED_UNICODE));
+check('本文に子機名とIDが入る', str_contains($texts[0], '通用口') && str_contains($texts[0], Doorbell::formatId($hookDid)), $texts[0]);
+
+// 子機名は利用者が決める文字列なので、Slack の記法として解釈されないようにする
+$rename = $pdo->prepare('UPDATE devices SET display_name = :name WHERE id = :id');
+$rename->execute([':name' => '<https://evil|裏口>', ':id' => (int) $hookChild['id']]);
+$hookChild['display_name'] = '<https://evil|裏口>';
+$pdo->exec('DELETE FROM webhook_events');
+
+Doorbell::call($hookChild);
+$evilText = (string) (json_decode((string) $pdo->query('SELECT payload FROM webhook_events LIMIT 1')->fetchColumn(), true)['text'] ?? '');
+check('本文の子機名がエスケープされる', str_contains($evilText, '&lt;https://evil|裏口&gt;'), $evilText);
+
+$rename->execute([':name' => '通用口', ':id' => (int) $hookChild['id']]);
+$hookChild['display_name'] = '通用口';
+
+// 送信先には届かないので、試行回数が増えて次回送信が先送りされる
+Webhook::dispatch();
+$row = $pdo->query('SELECT attempts, next_attempt_at FROM webhook_events ORDER BY id ASC LIMIT 1')->fetch();
+check('配送に失敗すると試行回数が増える', (int) ($row['attempts'] ?? 0) === 1, json_encode($row));
+check('配送に失敗すると次回送信が先送りされる', (int) ($row['next_attempt_at'] ?? 0) > time(), json_encode($row));
+
+// 届かない送信先を無限に抱えない
+$pdo->exec('UPDATE webhook_events SET attempts = ' . (Config::int('webhook_max_attempts') - 1) . ', next_attempt_at = 0');
+Webhook::dispatch();
+check('試行回数の上限で送信待ちから消える', $queued() === 0, (string) $queued());
+
+// 通知先URLのない連携は「受信専用」（API から応答するだけ）
+$recvOnly = Integration::create($hookDid, '受信のみ', '');
+Doorbell::call($hookChild);
+check('通知先のない連携には積まれない', $queued() === 1, (string) $queued());
+
+check('連携を失効させられる', Integration::delete($hook['id']) === true);
+check('失効させたトークンでは認証できない', Integration::authenticate($hook['token']) === null);
+check('失効させると送信待ちも消える', $queued() === 0, (string) $queued());
+
+Integration::delete($recvOnly['id']);
+check('連携がなくなるとオフライン判定に戻る', Doorbell::childState($hookChild)['parentOnline'] === false);
+
+echo "== デモ設置用の表示ヘルパー ==\n";
+// 共用の管理画面に秘匿値をそのまま並べないための伏せ字（復元はできない）
+$token = str_repeat('a', 32);
+check('トークンは先頭だけ残す', Http::mask($token) === 'aaaaaa…（以下伏せ字）', Http::mask($token));
+check('短い値はそのまま返す', Http::mask('abc') === 'abc');
+check(
+    '通知先URLはホストまで見せる',
+    Http::maskUrl('https://hooks.slack.com/services/A/B/C') === 'https://hooks.slack.com/…（以下伏せ字）',
+    Http::maskUrl('https://hooks.slack.com/services/A/B/C'),
+);
+check('URLでない値も伏せられる', str_contains(Http::maskUrl('not a url'), '伏せ字'));
+
+check('秒は秒で表示する', Doorbell::duration(45) === '45秒', Doorbell::duration(45));
+check('分と秒をまとめる', Doorbell::duration(90) === '1分30秒', Doorbell::duration(90));
+check('ちょうどの分は秒を出さない', Doorbell::duration(600) === '10分', Doorbell::duration(600));
+check('時間と分をまとめる', Doorbell::duration(28800) === '8時間', Doorbell::duration(28800));
+check('端数のある時間', Doorbell::duration(28860) === '8時間1分', Doorbell::duration(28860));
 
 echo "== ID の正規化 ==\n";
 check('ハイフン付きIDを受け付ける', Doorbell::normalizeId('1234-5678') === '12345678');

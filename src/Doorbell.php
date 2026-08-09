@@ -107,8 +107,21 @@ final class Doorbell
     /** 発行済みIDの一覧（パスワードは復元できないため含まない） */
     public static function listIds(): array
     {
-        $window = self::activeWindow();
-        $stmt   = Database::pdo()->prepare(<<<'SQL'
+        return array_map(self::exportId(...), self::idRows());
+    }
+
+    /** 1件のIDの概要。存在しなければ null */
+    public static function idSummary(string $doorbellIdInput): ?array
+    {
+        $rows = self::idRows(self::normalizeId($doorbellIdInput));
+
+        return $rows === [] ? null : self::exportId($rows[0]);
+    }
+
+    /** @return list<array> 一覧・詳細で共通の集計クエリ */
+    private static function idRows(?string $doorbellId = null): array
+    {
+        $stmt = Database::pdo()->prepare(<<<'SQL'
             SELECT
                 i.doorbell_id,
                 i.created_at,
@@ -116,19 +129,36 @@ final class Doorbell
                 (SELECT COUNT(*) FROM devices d
                   WHERE d.doorbell_id = i.doorbell_id AND d.role = 'parent' AND d.last_seen_at >= :active) AS parents,
                 (SELECT COUNT(*) FROM devices d
-                  WHERE d.doorbell_id = i.doorbell_id AND d.role = 'child' AND d.last_seen_at >= :active) AS children
+                  WHERE d.doorbell_id = i.doorbell_id AND d.role = 'child' AND d.last_seen_at >= :active) AS children,
+                (SELECT COUNT(*) FROM child_links l WHERE l.doorbell_id = i.doorbell_id) AS links,
+                (SELECT COUNT(*) FROM integrations g WHERE g.doorbell_id = i.doorbell_id) AS integrations
             FROM doorbell_ids i
+            WHERE :one = '' OR i.doorbell_id = :one
             ORDER BY i.created_at DESC
         SQL);
-        $stmt->execute([':active' => time() - $window]);
+        $stmt->execute([':active' => time() - self::activeWindow(), ':one' => $doorbellId ?? '']);
 
-        return array_map(static fn (array $row): array => [
+        return $stmt->fetchAll();
+    }
+
+    private static function exportId(array $row): array
+    {
+        $createdAt = (int) $row['created_at'];
+        $lifetime  = Config::int('id_lifetime');
+
+        return [
             'doorbell_id' => self::formatId((string) $row['doorbell_id']),
-            'created_at'  => date('Y-m-d H:i', (int) $row['created_at']),
+            'raw_id'      => (string) $row['doorbell_id'],
+            'created_at'  => date('Y-m-d H:i', $createdAt),
             'created_ip'  => (string) $row['created_ip'],
             'parents'     => (int) $row['parents'],
             'children'    => (int) $row['children'],
-        ], $stmt->fetchAll());
+            'links'       => (int) $row['links'],
+            'integrations' => (int) $row['integrations'],
+            // 自動失効・削除ロック（どちらも無効なら null）
+            'expires_in'  => $lifetime > 0 ? max(0, $createdAt + $lifetime - time()) : null,
+            'locked_for'  => self::deletionLockRemaining($createdAt),
+        ];
     }
 
     public static function countIds(): int
@@ -136,13 +166,91 @@ final class Doorbell
         return (int) Database::pdo()->query('SELECT COUNT(*) FROM doorbell_ids')->fetchColumn();
     }
 
-    /** 指定IDを削除する（関連する端末・履歴も削除される） */
+    /** 指定IDを削除する（関連する端末・履歴・子機URL・外部連携も削除される） */
     public static function deleteId(string $doorbellId): bool
     {
-        $stmt = Database::pdo()->prepare('DELETE FROM doorbell_ids WHERE doorbell_id = :id');
-        $stmt->execute([':id' => self::normalizeId($doorbellId)]);
+        $id   = self::normalizeId($doorbellId);
+        $pdo  = Database::pdo();
+        $stmt = $pdo->prepare('SELECT created_at FROM doorbell_ids WHERE doorbell_id = :id');
+        $stmt->execute([':id' => $id]);
+        $createdAt = $stmt->fetchColumn();
 
-        return $stmt->rowCount() > 0;
+        if ($createdAt === false) {
+            return false;
+        }
+        self::guardDeletion((int) $createdAt);
+
+        $delete = $pdo->prepare('DELETE FROM doorbell_ids WHERE doorbell_id = :id');
+        $delete->execute([':id' => $id]);
+
+        return $delete->rowCount() > 0;
+    }
+
+    /**
+     * 発行直後の削除・失効を拒否する。
+     *
+     * 管理パスワードを共有して設置する場合（デモ等）、発行した本人が使い始める前に
+     * 第三者に消されると使えないままになる。`deletion_grace_seconds` が 0 なら何もしない。
+     */
+    public static function guardDeletion(int $createdAt): void
+    {
+        $remaining = self::deletionLockRemaining($createdAt);
+        if ($remaining === null || $remaining <= 0) {
+            return;
+        }
+
+        throw new AppError(
+            sprintf(
+                '発行から%sのあいだは削除・失効できません（あと%s）。',
+                self::duration(Config::int('deletion_grace_seconds')),
+                self::duration($remaining),
+            ),
+            'deletion_locked',
+            403,
+        );
+    }
+
+    /** 削除できるようになるまでの残り秒数。機能が無効なら null */
+    private static function deletionLockRemaining(int $createdAt): ?int
+    {
+        $grace = Config::int('deletion_grace_seconds');
+
+        return $grace > 0 ? max(0, $createdAt + $grace - time()) : null;
+    }
+
+    /**
+     * 発行から `id_lifetime` を過ぎたIDを削除する。
+     *
+     * cron はないので、bootstrap.php が毎リクエストで呼ぶ（機能が無効なら何もしない）。
+     */
+    public static function expireOldIds(): void
+    {
+        $lifetime = Config::int('id_lifetime');
+        if ($lifetime <= 0) {
+            return;
+        }
+
+        // 比較の左辺は必ずカラムにする（SQLite の型親和性）
+        Database::pdo()
+            ->prepare('DELETE FROM doorbell_ids WHERE created_at <= :deadline')
+            ->execute([':deadline' => time() - $lifetime]);
+    }
+
+    /** 秒数を「1時間30分」のような日本語表記にする */
+    public static function duration(int $seconds): string
+    {
+        if ($seconds >= 3600) {
+            $minutes = intdiv($seconds % 3600, 60);
+
+            return intdiv($seconds, 3600) . '時間' . ($minutes > 0 ? $minutes . '分' : '');
+        }
+        if ($seconds >= 60) {
+            $rest = $seconds % 60;
+
+            return intdiv($seconds, 60) . '分' . ($rest > 0 ? $rest . '秒' : '');
+        }
+
+        return $seconds . '秒';
     }
 
     // ------------------------------------------------------------------
@@ -342,12 +450,16 @@ final class Doorbell
         return ['token' => $token, 'doorbell_id' => $doorbellId, 'display_name' => $displayName];
     }
 
-    /** 発行済みの子機URL一覧（管理画面用） */
-    public static function listChildLinks(): array
+    /** 発行済みの子機URL一覧（管理画面用）。IDを渡すとそのIDのぶんだけ返す */
+    public static function listChildLinks(?string $doorbellIdInput = null): array
     {
-        $rows = Database::pdo()
-            ->query('SELECT * FROM child_links ORDER BY doorbell_id ASC, created_at ASC')
-            ->fetchAll();
+        $only = $doorbellIdInput === null ? '' : self::normalizeId($doorbellIdInput);
+        $stmt = Database::pdo()->prepare(<<<'SQL'
+            SELECT * FROM child_links
+             WHERE :one = '' OR doorbell_id = :one
+             ORDER BY doorbell_id ASC, created_at ASC
+        SQL);
+        $stmt->execute([':one' => $only]);
 
         return array_map(static fn (array $row): array => [
             'token'       => (string) $row['token'],
@@ -355,16 +467,27 @@ final class Doorbell
             'displayName' => (string) $row['display_name'],
             'createdAt'   => date('Y-m-d H:i', (int) $row['created_at']),
             'lastUsedAt'  => (int) $row['last_used_at'] > 0 ? date('Y-m-d H:i', (int) $row['last_used_at']) : '—',
-        ], $rows);
+            'lockedFor'   => self::deletionLockRemaining((int) $row['created_at']),
+        ], $stmt->fetchAll());
     }
 
     /** 子機URLを失効させる */
     public static function deleteChildLink(string $token): bool
     {
-        $stmt = Database::pdo()->prepare('DELETE FROM child_links WHERE token = :token');
+        $pdo  = Database::pdo();
+        $stmt = $pdo->prepare('SELECT created_at FROM child_links WHERE token = :token');
         $stmt->execute([':token' => self::normalizeToken($token)]);
+        $createdAt = $stmt->fetchColumn();
 
-        return $stmt->rowCount() > 0;
+        if ($createdAt === false) {
+            return false;
+        }
+        self::guardDeletion((int) $createdAt);
+
+        $delete = $pdo->prepare('DELETE FROM child_links WHERE token = :token');
+        $delete->execute([':token' => self::normalizeToken($token)]);
+
+        return $delete->rowCount() > 0;
     }
 
     /** トークンから子機URLのレコードを取得する */
@@ -495,7 +618,10 @@ final class Doorbell
                  WHERE id = :id
             SQL)->execute([':now' => $now, ':name' => (string) $device['display_name'], ':id' => (int) $pending['id']]);
 
-            return self::callById((int) $pending['id']);
+            $call = self::callById((int) $pending['id']);
+            Webhook::emit((string) $device['doorbell_id'], 'call', $call);
+
+            return $call;
         }
 
         $pdo->prepare(<<<'SQL'
@@ -508,17 +634,40 @@ final class Doorbell
             ':now'    => $now,
         ]);
 
-        return self::callById((int) $pdo->lastInsertId());
+        $call = self::callById((int) $pdo->lastInsertId());
+        Webhook::emit((string) $device['doorbell_id'], 'call', $call);
+
+        return $call;
     }
 
     /** 親機からの応答 */
     public static function respond(array $device, int $callId, string $responseKey): array
     {
+        return self::respondBy(
+            (string) $device['doorbell_id'],
+            (string) $device['display_name'],
+            $callId,
+            $responseKey,
+        );
+    }
+
+    /**
+     * 応答の実体。応答者を端末レコードではなく名前で受け取る。
+     *
+     * 外部連携（Slack 等）からの応答もここを通す。連携のために devices の行を作ると、
+     * 親機の同時接続数の枠を消費し、子機から見た「親機の稼働状態」にも混ざってしまうため。
+     */
+    public static function respondBy(
+        string $doorbellId,
+        string $responderName,
+        int $callId,
+        string $responseKey,
+    ): array {
         if (!isset(self::RESPONSES[$responseKey])) {
             throw new AppError('不正な応答です。', 'invalid_response');
         }
 
-        self::expireStaleCalls((string) $device['doorbell_id']);
+        self::expireStaleCalls($doorbellId);
 
         $now  = time();
         $stmt = Database::pdo()->prepare(<<<'SQL'
@@ -532,28 +681,45 @@ final class Doorbell
         SQL);
         $stmt->execute([
             ':now'      => $now,
-            ':name'     => (string) $device['display_name'],
+            ':name'     => $responderName,
             ':key'      => $responseKey,
             ':message'  => self::RESPONSES[$responseKey],
             ':id'       => $callId,
-            ':doorbell' => (string) $device['doorbell_id'],
+            ':doorbell' => $doorbellId,
         ]);
 
         if ($stmt->rowCount() === 0) {
             throw new AppError('この呼び出しは既に終了しています。', 'call_closed', 409);
         }
 
-        return self::callById($callId);
+        $call = self::callById($callId);
+        Webhook::emit($doorbellId, 'answered', $call);
+
+        return $call;
     }
 
     /** 不在判定秒数を過ぎた応答待ちの呼び出しを「応答なし」に確定する */
     public static function expireStaleCalls(string $doorbellId): void
     {
-        $now = time();
+        $pdo      = Database::pdo();
+        $now      = time();
+        $deadline = $now - Config::int('absence_timeout');
+
+        // 通知の送信先がある場合だけ、確定する呼び出しを先に控えておく。
+        // ポーリングのたびに呼ばれるため、連携がなければ余分なクエリを投げない。
+        $expiring = [];
+        if (Integration::targets($doorbellId) !== []) {
+            $stmt = $pdo->prepare(<<<'SQL'
+                SELECT * FROM calls
+                 WHERE doorbell_id = :id AND status = 'waiting' AND created_at <= :deadline
+            SQL);
+            $stmt->execute([':id' => $doorbellId, ':deadline' => $deadline]);
+            $expiring = $stmt->fetchAll();
+        }
 
         // 比較の左辺は必ずカラムにする。SQLite では式と文字列パラメータを比較すると
         // 型親和性が働かず、数値とテキストの比較になって常に真になってしまうため。
-        Database::pdo()->prepare(<<<'SQL'
+        $pdo->prepare(<<<'SQL'
             UPDATE calls
                SET status = 'no_answer',
                    responded_at = :now,
@@ -566,8 +732,18 @@ final class Doorbell
             ':now'      => $now,
             ':message'  => self::NO_ANSWER_MESSAGE,
             ':id'       => $doorbellId,
-            ':deadline' => $now - Config::int('absence_timeout'),
+            ':deadline' => $deadline,
         ]);
+
+        foreach ($expiring as $row) {
+            Webhook::emit($doorbellId, 'no_answer', self::exportCall([
+                ...$row,
+                'status'           => 'no_answer',
+                'responded_at'     => $now,
+                'response_key'     => 'timeout',
+                'response_message' => self::NO_ANSWER_MESSAGE,
+            ]));
+        }
     }
 
     // ------------------------------------------------------------------
@@ -577,7 +753,20 @@ final class Doorbell
     /** 親機画面に表示する状態 */
     public static function parentState(array $device): array
     {
-        $doorbellId = (string) $device['doorbell_id'];
+        return self::monitorState(
+            (string) $device['doorbell_id'],
+            (string) $device['display_name'],
+            'parent',
+        );
+    }
+
+    /**
+     * 呼び出しを受ける側（親機・外部連携）に見せる状態。
+     *
+     * 端末レコードではなく ID と表示名で受け取るのは、連携からも同じ状態を返せるようにするため。
+     */
+    public static function monitorState(string $doorbellId, string $viewerName, string $role): array
+    {
         self::expireStaleCalls($doorbellId);
 
         // 複数の子機から同時に呼び出される場合があるため、応答待ちを全件返す。
@@ -590,8 +779,8 @@ final class Doorbell
         $stmt->execute([':id' => $doorbellId]);
 
         return [
-            'role'        => 'parent',
-            'displayName' => (string) $device['display_name'],
+            'role'        => $role,
+            'displayName' => $viewerName,
             'doorbellId'  => self::formatId($doorbellId),
             'serverTime'  => time(),
             'activeCalls' => array_map(self::exportCall(...), $stmt->fetchAll()),
@@ -629,7 +818,10 @@ final class Doorbell
             'displayName'  => (string) $device['display_name'],
             'doorbellId'   => self::formatId($doorbellId),
             'serverTime'   => time(),
-            'parentOnline' => self::countActive($doorbellId, 'parent') > 0,
+            // 連携があるIDは常にオンライン扱いにする。外部（Slack 等）から応答できるので、
+            // 親機がポーリングしていなくても呼び出しは届くため
+            'parentOnline' => self::countActive($doorbellId, 'parent') > 0
+                || Integration::existsFor($doorbellId),
             'currentCall'  => $current,
             'history'      => self::history($deviceId),
         ];
@@ -816,6 +1008,10 @@ final class Doorbell
 
         $pdo->prepare('DELETE FROM devices WHERE last_seen_at < :limit')
             ->execute([':limit' => time() - Config::int('session_lifetime')]);
+
+        // 送信を諦めた通知が残ることはないが、連携を消した直後などの取りこぼしに備える
+        $pdo->prepare('DELETE FROM webhook_events WHERE created_at < :limit')
+            ->execute([':limit' => time() - 86400]);
     }
 
     /** 入力されたIDを内部表現（数字8桁）に正規化する */
@@ -834,7 +1030,8 @@ final class Doorbell
             : $doorbellId;
     }
 
-    private static function normalizeDisplayName(string $name): string
+    /** 表示名（親機・子機の名前、外部連携から送られる応答者名）を整える */
+    public static function normalizeDisplayName(string $name): string
     {
         $name = trim(preg_replace('/[\x00-\x1F\x7F]+/u', '', $name) ?? '');
 

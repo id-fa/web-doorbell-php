@@ -20,10 +20,12 @@ PORT="${PORT:-8788}"
 BASE="${BASE_URL:-}"
 SERVER_PID=""
 LINK_PID=""
+DEMO_PID=""
 
 cleanup() {
     [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null
     [ -n "$LINK_PID" ] && kill "$LINK_PID" 2>/dev/null
+    [ -n "$DEMO_PID" ] && kill "$DEMO_PID" 2>/dev/null
     rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -233,9 +235,14 @@ grep -q 'link_disabled' <<< "$OUT" && R=1 || R=0
 check "既定では子機URLログインが無効" "$R" "$OUT"
 
 if [ -n "$SERVER_PID" ]; then
+    # 既定で無効な機能（子機URL・外部連携API）をまとめて有効にした専用サーバー
     cat > "$WORK/link_config.php" <<'PHP'
 <?php
-return ['child_link_login' => true];
+return [
+    'child_link_login'      => true,
+    'integration_api'       => true,
+    'webhook_allowed_hosts' => ['hooks.slack.com'],
+];
 PHP
     LPORT=$((PORT + 1))
     DOORBELL_CONFIG_PATH="$WORK/link_config.php" \
@@ -254,10 +261,23 @@ PHP
          -d "csrf_token=$LC&action=login&password=1234" "$LBASE/admin.php"
     LC=$(csrf_of "$WORK/l2.html")
 
-    grep -q 'data-link-id' "$WORK/l2.html" && R=1 || R=0
-    check "有効時は管理画面に子機URLボタンが出る" "$R" ""
-    grep -q 'data-link-id' "$WORK/a4.html" && R=0 || R=1
-    check "無効時は管理画面に子機URLボタンが出ない" "$R" ""
+    # 一覧のIDは詳細画面へのリンクになっている
+    RAW=$(echo "$DID" | tr -d '-')
+    grep -q "admin.php?id=$RAW" "$WORK/l2.html" && R=1 || R=0
+    check "一覧のIDが詳細画面へのリンクになる" "$R" ""
+
+    # 子機URL・外部連携の発行フォームは詳細画面にある
+    curl -s -b "$WORK/l.cookie" -o "$WORK/l2d.html" "$LBASE/admin.php?id=$RAW"
+    grep -q 'value="child_link"' "$WORK/l2d.html" && R=1 || R=0
+    check "有効時は詳細画面に子機URLの発行フォームが出る" "$R" ""
+    grep -q 'value="integration"' "$WORK/l2d.html" && R=1 || R=0
+    check "有効時は詳細画面に外部連携の発行フォームが出る" "$R" ""
+
+    curl -s -b "$WORK/admin.cookie" -o "$WORK/a5.html" "$BASE/admin.php?id=$RAW"
+    grep -q 'value="child_link"' "$WORK/a5.html" && R=0 || R=1
+    check "無効時は詳細画面に子機URLの発行フォームが出ない" "$R" ""
+    grep -q 'value="integration"' "$WORK/a5.html" && R=0 || R=1
+    check "無効時は詳細画面に外部連携の発行フォームが出ない" "$R" ""
 
     # 非ASCIIの表示名が化けないよう、ボディはファイル経由で渡す
     printf 'csrf_token=%s&action=child_link&doorbell_id=%s&display_name=%s' "$LC" "$DID" '勝手口' \
@@ -308,14 +328,198 @@ PHP
     grep -q 'invalid_link' <<< "$OUT" && R=1 || R=0
     check "失効させた子機URLでは入れない" "$R" "$OUT"
 
-    # 子機URLで入った端末も、ログアウトにはパスワードが必要（枠を解放して後続のテストへ戻す）
+    # 子機URLで入った端末も、ログアウトにはパスワードが必要
     OUT=$(lapi "$LKC" '{"action":"logout"}')
     grep -q 'invalid_password' <<< "$OUT" && R=1 || R=0
     check "子機URLで入った端末もログアウトにパスワードが要る" "$R" "$OUT"
+
+    echo "== 外部連携API =="
+    # 既定では無効（メイン側のサーバーは integration_api を有効にしていない）
+    OUT=$(curl -s -H 'Content-Type: application/json' -d '{"action":"state"}' "$BASE/integration.php")
+    grep -q 'integration_disabled' <<< "$OUT" && R=1 || R=0
+    check "既定では外部連携APIが無効" "$R" "$OUT"
+
+    # 管理画面から連携トークンを発行する（通知先URLは省略＝受信専用）
+    LC=$(csrf_of "$WORK/l3.html")
+    printf 'csrf_token=%s&action=integration&doorbell_id=%s&label=%s&webhook_url=' "$LC" "$DID" 'Slack受付' \
+        > "$WORK/hook_post.txt"
+    curl -s -b "$WORK/l.cookie" -c "$WORK/l.cookie" -o "$WORK/l7.html" \
+         -H 'Content-Type: application/x-www-form-urlencoded' \
+         --data-binary "@$WORK/hook_post.txt" "$LBASE/admin.php"
+    ITOKEN=$(grep -o 'dbi_[0-9a-f]\{48\}' "$WORK/l7.html" | head -1)
+    [ -n "$ITOKEN" ] && R=1 || R=0
+    check "管理画面から連携トークンを発行できる" "$R" "$(grep -o 'class="error"[^<]*<[^<]*' "$WORK/l7.html")"
+
+    # 許可されていないホストの通知先は登録できない（サーバーを踏み台にされないため）
+    printf 'csrf_token=%s&action=integration&doorbell_id=%s&label=x&webhook_url=%s' \
+        "$LC" "$DID" 'https://example.com/hook' > "$WORK/hook_bad.txt"
+    curl -s -b "$WORK/l.cookie" -c "$WORK/l.cookie" -o "$WORK/l8.html" \
+         -H 'Content-Type: application/x-www-form-urlencoded' \
+         --data-binary "@$WORK/hook_bad.txt" "$LBASE/admin.php"
+    grep -q '許可されていないホスト' "$WORK/l8.html" && R=1 || R=0
+    check "許可外ホストの通知先は登録できない" "$R" ""
+
+    iapi() { # $1=JSONボディ（Authorization ヘッダでトークンを渡す）
+        printf '%s' "$1" > "$WORK/payload.json"
+        curl -s -H 'Content-Type: application/json' -H "Authorization: Bearer $ITOKEN" \
+             --data-binary "@$WORK/payload.json" "$LBASE/integration.php"
+    }
+
+    OUT=$(curl -s -H 'Content-Type: application/json' -d '{"action":"state"}' "$LBASE/integration.php")
+    grep -q 'invalid_token' <<< "$OUT" && R=1 || R=0
+    check "トークンなしの連携APIは拒否される" "$R" "$OUT"
+
+    OUT=$(curl -s -H "Authorization: Bearer $ITOKEN" "$LBASE/integration.php")
+    grep -q 'method_not_allowed' <<< "$OUT" && R=1 || R=0
+    check "GETでの連携API呼び出しは拒否される" "$R" "$OUT"
+
+    # 子機URLで入った端末から呼び出し、連携API側で受け取る
+    lapi "$LKC" '{"action":"call"}' > /dev/null
+    OUT=$(iapi '{"action":"state"}')
+    grep -q '"role":"integration"' <<< "$OUT" && R=1 || R=0
+    check "連携トークンで状態を取得できる" "$R" "$OUT"
+    grep -q '"childName":"勝手口"' <<< "$OUT" && R=1 || R=0
+    check "連携APIに応答待ちの呼び出しが見える" "$R" "$OUT"
+    grep -q '"responses":{"in1"' <<< "$OUT" && R=1 || R=0
+    check "連携APIが応答ボタンの定義を返す" "$R" "$OUT"
+    ICALL=$(grep -o '"activeCalls":\[{"id":[0-9]*' <<< "$OUT" | grep -o '[0-9]*$')
+
+    # ボディでトークンを渡す経路（Authorization ヘッダが届かない環境向け）
+    OUT=$(iapi "{\"action\":\"state\",\"token\":\"$ITOKEN\"}")
+    grep -q '"ok":true' <<< "$OUT" && R=1 || R=0
+    check "ボディのトークンでも認証できる" "$R" "$OUT"
+
+    OUT=$(iapi "{\"action\":\"respond\",\"call_id\":$ICALL,\"response\":\"evil\"}")
+    grep -q 'invalid_response' <<< "$OUT" && R=1 || R=0
+    check "連携APIでも未定義の応答は拒否される" "$R" "$OUT"
+
+    OUT=$(iapi "{\"action\":\"respond\",\"call_id\":$ICALL,\"response\":\"in1\",\"responder\":\"山田\"}")
+    grep -q '"activeCalls":\[\]' <<< "$OUT" && R=1 || R=0
+    check "連携APIから応答できる" "$R" "$OUT"
+
+    OUT=$(lapi "$LKC" '{"action":"state"}')
+    grep -q '"responder":"山田"' <<< "$OUT" && R=1 || R=0
+    check "連携APIの応答が子機に届く" "$R" "$OUT"
+
+    # 連携を失効させるとトークンは使えなくなる
+    IID=$(grep -o 'name="integration_id" value="[0-9]*"' "$WORK/l7.html" | head -1 | grep -o '[0-9]*')
+    curl -s -b "$WORK/l.cookie" -c "$WORK/l.cookie" -o "$WORK/l9.html" \
+         -d "csrf_token=$LC&action=integration_delete&integration_id=$IID" "$LBASE/admin.php"
+    OUT=$(iapi '{"action":"state"}')
+    grep -q 'invalid_token' <<< "$OUT" && R=1 || R=0
+    check "失効させた連携トークンでは拒否される" "$R" "$OUT"
+
+    # 子機の枠を解放して後続のテストへ戻す
     lapi "$LKC" "{\"action\":\"logout\",\"password\":\"$CPW\"}" > /dev/null
 
     kill "$LINK_PID" 2>/dev/null
     LINK_PID=""
+
+    echo "== デモ設置用のオプション =="
+    # 管理パスワードを共有して設置する場合の設定（伏せ字・削除ロック・自動失効）
+    cat > "$WORK/demo_config.php" <<'PHP'
+<?php
+return [
+    'child_link_login'       => true,
+    'integration_api'        => true,
+    'mask_secrets'           => true,
+    'deletion_grace_seconds' => 600,
+    'id_lifetime'            => 3600,
+];
+PHP
+    DPORT=$((PORT + 2))
+    DOORBELL_CONFIG_PATH="$WORK/demo_config.php" \
+        php -S "127.0.0.1:$DPORT" -t "$ROOT/public" > "$WORK/demo_server.log" 2>&1 &
+    DEMO_PID=$!
+    DBASE="http://127.0.0.1:$DPORT"
+    for _ in $(seq 1 50); do
+        curl -s -o /dev/null "$DBASE/index.php" && break
+        sleep 0.2
+    done
+
+    dadmin() { # $1=出力先 $2以降=curl の追加引数
+        local out="$1"; shift
+        curl -s -b "$WORK/dm.cookie" -c "$WORK/dm.cookie" -o "$WORK/$out" "$@"
+    }
+
+    curl -s -c "$WORK/dm.cookie" -o "$WORK/m1.html" "$DBASE/admin.php"
+    MC=$(csrf_of "$WORK/m1.html")
+    dadmin m2.html -d "csrf_token=$MC&action=login&password=1234" "$DBASE/admin.php"
+    MC=$(csrf_of "$WORK/m2.html")
+    dadmin m3.html -d "csrf_token=$MC&action=issue" "$DBASE/admin.php"
+    MDID=$(grep -o '<dd>[0-9]\{4\}-[0-9]\{4\}</dd>' "$WORK/m3.html" | head -1 | grep -o '[0-9]\{4\}-[0-9]\{4\}')
+    MRAW=$(echo "$MDID" | tr -d '-')
+    [ -n "$MRAW" ] && R=1 || R=0
+    check "デモ設定でもIDを発行できる" "$R" "$(grep -o 'class="error"[^<]*<[^<]*' "$WORK/m3.html")"
+
+    grep -q 'あと' "$WORK/m3.html" && R=1 || R=0
+    check "一覧に自動失効までの残り時間が出る" "$R" ""
+
+    # 子機URLと外部連携を発行する（発行した直後は全体が見える）
+    printf 'csrf_token=%s&action=child_link&doorbell_id=%s&display_name=%s' "$MC" "$MRAW" '通用口' > "$WORK/m_link.txt"
+    dadmin m4.html -H 'Content-Type: application/x-www-form-urlencoded' \
+        --data-binary "@$WORK/m_link.txt" "$DBASE/admin.php?id=$MRAW"
+    MTOKEN=$(grep -o 'index\.php?child=[0-9a-f]\{32\}' "$WORK/m4.html" | head -1 | grep -o '[0-9a-f]\{32\}')
+    [ -n "$MTOKEN" ] && R=1 || R=0
+    check "発行した直後の子機URLは全体が見える" "$R" ""
+
+    printf 'csrf_token=%s&action=integration&doorbell_id=%s&label=x&webhook_url=%s' \
+        "$MC" "$MRAW" 'https://hooks.slack.com/services/AAA/BBB/CCC' > "$WORK/m_hook.txt"
+    dadmin m5.html -H 'Content-Type: application/x-www-form-urlencoded' \
+        --data-binary "@$WORK/m_hook.txt" "$DBASE/admin.php?id=$MRAW"
+    MIID=$(grep -o 'name="integration_id" value="[0-9]*"' "$WORK/m5.html" | head -1 | grep -o '[0-9]*')
+    grep -q 'dbi_[0-9a-f]\{48\}' "$WORK/m5.html" && R=1 || R=0
+    check "発行した直後の連携トークンは全体が見える" "$R" ""
+
+    # 開き直すと伏せ字になる
+    dadmin m6.html "$DBASE/admin.php?id=$MRAW"
+    grep -q "child=$MTOKEN" "$WORK/m6.html" && R=0 || R=1
+    check "開き直すと子機URLが伏せ字になる" "$R" "$(grep -o 'index\.php?child=[^<"]*' "$WORK/m6.html" | head -1)"
+    grep -q '伏せ字' "$WORK/m6.html" && R=1 || R=0
+    check "伏せ字であることが画面に出る" "$R" ""
+    grep -q 'hooks.slack.com/services/AAA' "$WORK/m6.html" && R=0 || R=1
+    check "通知先URLのパスが伏せ字になる" "$R" ""
+    grep -q 'data-copy="url-' "$WORK/m6.html" && R=0 || R=1
+    check "伏せ字のときはコピーボタンを出さない" "$R" ""
+
+    # 発行直後は削除・失効できない（画面で無効にするだけでなくサーバー側でも拒否する）
+    OUT=$(curl -s -b "$WORK/dm.cookie" -d "csrf_token=$MC&action=delete&doorbell_id=$MRAW" "$DBASE/admin.php")
+    grep -q '削除・失効できません' <<< "$OUT" && R=1 || R=0
+    check "発行直後のID削除は拒否される" "$R" "$(grep -o '<p class="error">[^<]*' <<< "$OUT")"
+
+    OUT=$(curl -s -b "$WORK/dm.cookie" -d "csrf_token=$MC&action=child_link_delete&token=$MTOKEN" "$DBASE/admin.php?id=$MRAW")
+    grep -q '削除・失効できません' <<< "$OUT" && R=1 || R=0
+    check "発行直後の子機URL失効は拒否される" "$R" "$(grep -o '<p class="error">[^<]*' <<< "$OUT")"
+
+    OUT=$(curl -s -b "$WORK/dm.cookie" -d "csrf_token=$MC&action=integration_delete&integration_id=$MIID" "$DBASE/admin.php?id=$MRAW")
+    grep -q '削除・失効できません' <<< "$OUT" && R=1 || R=0
+    check "発行直後の連携失効は拒否される" "$R" "$(grep -o '<p class="error">[^<]*' <<< "$OUT")"
+
+    # 既定（両方とも無効）のサーバーでは今までどおり削除できる
+    grep -q '削除・失効できません' "$WORK/l9.html" && R=0 || R=1
+    check "既定の設定では削除ロックが掛からない" "$R" ""
+
+    # 発行時刻を寿命より前にずらすと、次のアクセスで消える
+    php -r '
+        $pdo = new PDO("sqlite:" . $argv[1]);
+        $pdo->prepare("UPDATE doorbell_ids SET created_at = created_at - 4000 WHERE doorbell_id = :id")
+            ->execute([":id" => $argv[2]]);
+    ' "$DOORBELL_DB_PATH" "$MRAW"
+    dadmin m7.html "$DBASE/admin.php"
+    grep -q "admin.php?id=$MRAW" "$WORK/m7.html" && R=0 || R=1
+    check "寿命を過ぎたIDが自動的に消える" "$R" ""
+
+    LEFT=$(php -r '
+        $pdo = new PDO("sqlite:" . $argv[1]);
+        $stmt = $pdo->prepare("SELECT COUNT(*) FROM child_links WHERE doorbell_id = :id");
+        $stmt->execute([":id" => $argv[2]]);
+        echo (int) $stmt->fetchColumn();
+    ' "$DOORBELL_DB_PATH" "$MRAW")
+    [ "$LEFT" = "0" ] && R=1 || R=0
+    check "自動失効で子機URLも一緒に消える" "$R" "$LEFT 件残っている"
+
+    kill "$DEMO_PID" 2>/dev/null
+    DEMO_PID=""
 fi
 
 echo "== 端末キーの使い回しによる同時接続上限の回避 =="

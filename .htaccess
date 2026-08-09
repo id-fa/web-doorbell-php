@@ -7,8 +7,8 @@
 <IfModule mod_rewrite.c>
     RewriteEngine On
 
-    # 設定ファイル・データベース・ソース・テストへの直接アクセスを拒否
-    RewriteRule ^(config|data|src|tests)/ - [F,L]
+    # 設定ファイル・データベース・ソース・テスト・サンプルへの直接アクセスを拒否
+    RewriteRule ^(config|data|src|tests|examples)/ - [F,L]
 
     # ルート直下のドキュメント類も公開しない
     RewriteRule ^[^/]+\.(md|txt)$ - [F,L]

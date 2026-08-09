@@ -40,7 +40,7 @@ header('Referrer-Policy: same-origin');
 <meta name="theme-color" content="#1f2937">
 <meta name="robots" content="noindex, nofollow">
 <title>ドアベル</title>
-<link rel="stylesheet" href="assets/style.css?v=5">
+<link rel="stylesheet" href="assets/style.css?v=6">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🔔</text></svg>">
 </head>
 <body>

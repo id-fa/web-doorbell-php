@@ -28,6 +28,9 @@ for f in src/*.php public/*.php config/*.php tests/*.php; do php -l "$f"; done
 node --check public/assets/app.js
 node --check public/assets/admin.js
 
+# 送信待ちの通知を手で配送する（CLI では自動実行しない）
+php -r "require 'src/bootstrap.php'; Doorbell\Webhook::dispatch();"
+
 # DB をリセット（スキーマは初回アクセス時に自動生成される）
 rm -f data/doorbell.sqlite data/doorbell.sqlite-shm data/doorbell.sqlite-wal
 
@@ -39,7 +42,9 @@ php -r "require 'src/bootstrap.php'; use Doorbell\Doorbell; print_r(Doorbell::is
 DB の場所は環境変数 `DOORBELL_DB_PATH`、設定ファイルの場所は `DOORBELL_CONFIG_PATH` で
 上書きできる（`Config::load()` が解釈する）。これは CLI と組み込みサーバー
 （SAPI が `cli` / `cli-server`）でのみ有効。php-fpm 等の本番 SAPI では無視される。
-既定と違う設定での挙動を検証したいときは、`e2e_test.sh` の子機URLのブロックのように
+`logic_test.php` は設置環境の `config/config.php` に影響されないよう、一時 config を書いて
+`DOORBELL_CONFIG_PATH` で差し替えている（既定値＋外部連携を有効にしたもの）。
+HTTP 経由で既定と違う設定を検証したいときは、`e2e_test.sh` の子機URL／外部連携のブロックのように
 一時 config を書いて別ポートにサーバーを立てる。
 
 ブラウザで手動確認するときの注意:
@@ -64,7 +69,8 @@ DB の場所は環境変数 `DOORBELL_DB_PATH`、設定ファイルの場所は 
 | --- | --- |
 | `public/index.php` | メイン画面の HTML シェルのみ。全画面（ログイン／親機／子機）の DOM を最初から出力し、切り替えは JS が行う |
 | `public/api.php` | 親機・子機の全操作。`action` で分岐する単一エンドポイント |
-| `public/admin.php` | ID 発行管理・子機URLの発行。ここだけ従来型のサーバーサイドレンダリング + POST（`assets/admin.js` は操作の補助のみ） |
+| `public/admin.php` | ID 発行管理。ここだけ従来型のサーバーサイドレンダリング + POST（`assets/admin.js` はコピー補助のみ）。**一覧（`admin.php`）と ID 詳細（`admin.php?id=…`）の 2 画面**を 1 ファイルで出し分ける。子機URL・外部連携・削除はすべて詳細画面 |
+| `public/integration.php` | 外部連携（Slack 等）向け。Cookie を使わずトークンだけで認証する機械向けの入口 |
 
 `src/bootstrap.php` がオートローダを兼ねる（`Doorbell\` → `src/`）。
 `AppError` は `src/Http.php` に同居しているため bootstrap で先に読み込んでいる。
@@ -81,6 +87,9 @@ state の主な中身:
 - 親機: `activeCalls`（応答待ちの呼び出し全件・古い順）、`children`（子機の稼働状態）、`history`
 - 子機: `currentCall`、`parentOnline`、`history`
 
+親機の state は `Doorbell::monitorState()`（ID と表示名だけを取る）に切り出してあり、
+`integration.php` も同じものを返す。親機向けの項目を足すと連携にも自動的に載る。
+
 ### 時間に依存する判定はすべてポーリング時に評価する
 
 cron やバックグラウンドジョブは存在しない。以下はすべて誰かがアクセスした瞬間に計算される。
@@ -90,6 +99,12 @@ cron やバックグラウンドジョブは存在しない。以下はすべて
 - オンライン判定: `devices.last_seen_at` が `activeWindow()`（= `polling_interval × parent_offline_polls`）
   以内かどうか。ログアウトは `last_seen_at = 0` で枠を即時解放する
 - 古いデータの掃除: `bootstrap.php` が約 1/200 の確率で `Doorbell::cleanup()` を実行する
+- 外部連携への通知: `Webhook::emit()` は `webhook_events` に積むだけ。実際の送信は
+  `bootstrap.php` が登録した shutdown 関数が、**レスポンスを返し切ってから**行う
+  （`fastcgi_finish_request()` があれば呼ぶ）。CLI では自動実行しない
+- IDの自動失効: `Doorbell::expireOldIds()` を `bootstrap.php` が**毎リクエスト**呼ぶ。
+  「もう使えない」ことが動作に直結するので、cleanup のような確率実行にしない。
+  `id_lifetime` が 0（既定）なら DB に触らず即座に返る
 
 ### 認証と端末の同一性は別物
 
@@ -110,6 +125,10 @@ cron やバックグラウンドジョブは存在しない。以下はすべて
   ログイン後の処理は通常ログインと同じ `Doorbell::registerDevice()` を通す（上限・セッション鍵の扱いを揃えるため）。
   クライアントはセッション切れ時に `relogin()` で自動的に入り直し（無人端末をログイン画面で止めない）、
   子機画面のログアウトボタン（`#child-logout`）は非表示にする（開き直せば再ログインされるため意味がない）
+- **外部連携**（`integration_api`、既定 false）は `integrations` のトークンだけで認証する第三の経路。
+  Cookie を読まないので CSRF トークンは要求しない（読まない以上、ブラウザからの偽装リクエストでは認証できない）。
+  **連携からの応答で `devices` の行を作らないこと。** 作ると `max_parents_per_id` の枠を消費し、
+  子機から見た親機のオンライン判定にも混ざる。応答は `Doorbell::respondBy()`（ID と応答者名だけを取る）を通す
 
 ### 呼び出しのライフサイクル
 
@@ -145,6 +164,18 @@ WHERE created_at <= :deadline
   `Doorbell::RESPONSES` を使う。クライアントから任意の文字列を送らせない
 - 設定項目を増やすときは `Config::DEFAULTS` と `config/config.sample.php` の両方に追加する。
   クライアントに渡す必要があるものだけ `Config::publicValues()` に載せる（秘匿値を混ぜない）
+- 通知先URLは **https と `webhook_allowed_hosts` に限定**し、リダイレクトも追わない。
+  管理画面から任意のURLを登録できると、サーバーを踏み台にして内部ネットワークへ
+  リクエストを送れてしまう（SSRF）。この制限を緩めないこと
+- **削除ロック（`deletion_grace_seconds`）はサーバー側で強制する。** ボタンを
+  `disabled` にするだけでは、フォームを直接送れば消せてしまう。判定は
+  `Doorbell::guardDeletion()` に集約してあり、`deleteId()` / `deleteChildLink()` /
+  `Integration::delete()` の 3 か所から呼ぶ。削除系を増やすときはここも通すこと
+- **伏せ字（`mask_secrets`）は表示だけの機能。** モデル側は生の値を返し、
+  `admin.php` が `Http::mask()` / `Http::maskUrl()` を通して出す。伏せた値は
+  復元できないので、コピーボタンも一緒に隠す
+- `examples/` はサンプルコード置き場。テストの対象外で、公開ディレクトリの外に置く
+  （`.htaccess` とリポジトリ直下の `.htaccess` の両方で遮断している）
 - `config/config.php` は `.gitignore` 済み。既定の管理パスワードは `1234` のまま
 
 ### ログイン失敗の応答を変えない

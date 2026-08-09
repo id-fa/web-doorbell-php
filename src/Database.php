@@ -142,6 +142,39 @@ final class Database
         SQL);
         $pdo->exec('CREATE INDEX IF NOT EXISTS idx_child_links_id ON child_links (doorbell_id, created_at)');
 
+        // 外部連携（Slack 等）。トークンはそれ自体がログイン情報なのでハッシュで保存する。
+        // webhook_url が空の連携は「受信専用」（API から状態取得・応答のみ行う）。
+        $pdo->exec(<<<'SQL'
+            CREATE TABLE IF NOT EXISTS integrations (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                doorbell_id  TEXT    NOT NULL,
+                label        TEXT    NOT NULL,
+                token_hash   TEXT    NOT NULL UNIQUE,
+                webhook_url  TEXT    NOT NULL DEFAULT '',
+                secret       TEXT    NOT NULL,
+                created_at   INTEGER NOT NULL,
+                last_used_at INTEGER NOT NULL DEFAULT 0,
+                FOREIGN KEY (doorbell_id) REFERENCES doorbell_ids (doorbell_id) ON DELETE CASCADE
+            )
+        SQL);
+        $pdo->exec('CREATE INDEX IF NOT EXISTS idx_integrations_id ON integrations (doorbell_id, created_at)');
+
+        // 通知の送信待ち行列。cron がないため、次に誰かがアクセスした時点で配送する。
+        // 送信に成功した行は削除するので、残っているのは未送信のものだけ。
+        $pdo->exec(<<<'SQL'
+            CREATE TABLE IF NOT EXISTS webhook_events (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                integration_id  INTEGER NOT NULL,
+                event           TEXT    NOT NULL,
+                payload         TEXT    NOT NULL,
+                attempts        INTEGER NOT NULL DEFAULT 0,
+                next_attempt_at INTEGER NOT NULL,
+                created_at      INTEGER NOT NULL,
+                FOREIGN KEY (integration_id) REFERENCES integrations (id) ON DELETE CASCADE
+            )
+        SQL);
+        $pdo->exec('CREATE INDEX IF NOT EXISTS idx_webhook_events_due ON webhook_events (next_attempt_at, id)');
+
         $pdo->exec(<<<'SQL'
             CREATE TABLE IF NOT EXISTS rate_limits (
                 bucket       TEXT    PRIMARY KEY,

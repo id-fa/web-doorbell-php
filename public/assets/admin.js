@@ -1,26 +1,11 @@
 /**
- * ID発行管理画面の補助スクリプト（子機URLの発行ダイアログとコピー）。
+ * ID発行管理画面の補助スクリプト（URL・トークンのコピー）。
  * 画面本体はサーバーサイドレンダリングなので、ここでは操作の補助だけを行う。
  */
 'use strict';
 
 (() => {
-  const dialog = document.getElementById('link-dialog');
-
-  // 発行済みIDの「子機URL」ボタン → 表示名を入力するダイアログ
-  document.querySelectorAll('[data-link-id]').forEach((button) => {
-    button.addEventListener('click', () => {
-      if (!dialog) return;
-      document.getElementById('link-target').textContent = button.dataset.linkId;
-      document.getElementById('link-doorbell-id').value = button.dataset.linkId;
-      dialog.showModal();
-      document.getElementById('link-name').focus();
-    });
-  });
-
-  document.getElementById('link-cancel')?.addEventListener('click', () => dialog?.close());
-
-  // URLのコピー（クリップボードが使えない環境では選択状態にする）
+  // クリップボードが使えない環境では、対象を選択状態にして手動コピーできるようにする
   document.querySelectorAll('[data-copy]').forEach((button) => {
     button.addEventListener('click', async () => {
       const target = document.getElementById(button.dataset.copy);

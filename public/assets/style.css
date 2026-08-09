@@ -754,35 +754,37 @@ button:focus-visible {
   user-select: all;
 }
 
-/* ---------- 管理画面のダイアログ ---------- */
+/* ---------- 管理画面のID詳細 ---------- */
 
-.dialog {
-  width: min(100%, 420px);
-  padding: 24px 22px;
-  color: var(--text);
-  background: var(--bg-card);
-  border: 1px solid var(--accent);
-  border-radius: var(--radius);
-  box-shadow: var(--shadow);
-}
+.admin a { color: var(--accent); }
 
-.dialog::backdrop {
-  background: rgb(15 23 42 / 70%);
-}
-
-.dialog-title {
+/* IDの概要（発行日時・稼働状況など） */
+.summary {
   margin: 0 0 10px;
-  font-size: 1.15rem;
-}
-
-.dialog-actions {
   display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 10px;
-  margin-top: 16px;
+  grid-template-columns: auto 1fr;
+  gap: 6px 16px;
+  align-items: baseline;
+  font-size: 0.9rem;
 }
 
-.dialog-actions .btn { margin-top: 0; }
+.summary dt {
+  color: var(--text-dim);
+  font-size: 0.82rem;
+}
+
+.summary dd { margin: 0; }
+
+/* 詳細画面に置く発行フォーム（一覧の間に挟まるので枠で区切る） */
+.inline-form {
+  margin: 10px 0 16px;
+  padding: 14px 16px;
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.inline-form .field:last-of-type { margin-bottom: 0; }
 
 .meta {
   margin: 0 0 6px;

@@ -191,4 +191,26 @@ final class Http
     {
         return htmlspecialchars((string) $text, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
     }
+
+    /**
+     * 値の先頭だけを見せて残りを伏せる（`mask_secrets` 用）。
+     *
+     * どれがどれか見分けられる程度は残す。伏せた部分は復元できないので、
+     * 表示ではなく「一覧に秘匿値を並べない」ことが目的。
+     */
+    public static function mask(string $value, int $keep = 6): string
+    {
+        return mb_strlen($value) <= $keep ? $value : mb_substr($value, 0, $keep) . '…（以下伏せ字）';
+    }
+
+    /** URL のホストまでを見せて、以降のパスを伏せる */
+    public static function maskUrl(string $url): string
+    {
+        $parts = parse_url($url);
+        if ($parts === false || ($parts['host'] ?? '') === '') {
+            return self::mask($url);
+        }
+
+        return ($parts['scheme'] ?? 'https') . '://' . $parts['host'] . '/…（以下伏せ字）';
+    }
 }

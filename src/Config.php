@@ -30,6 +30,13 @@ final class Config
         'history_display_limit'  => 20,
         'child_logout_password'  => true,
         'child_link_login'       => false,
+        'integration_api'        => false,
+        'webhook_allowed_hosts'  => ['hooks.slack.com'],
+        'webhook_timeout'        => 5,
+        'webhook_max_attempts'   => 5,
+        'mask_secrets'           => false,
+        'deletion_grace_seconds' => 0,
+        'id_lifetime'            => 0,
         'trust_proxy'            => false,
         'rate_limit'             => [
             'window'       => 60,
@@ -80,6 +87,19 @@ final class Config
         $values['child_status_window']    = max(60, (int) $values['child_status_window']);
         $values['child_logout_password']  = (bool) $values['child_logout_password'];
         $values['child_link_login']       = (bool) $values['child_link_login'];
+        $values['integration_api']        = (bool) $values['integration_api'];
+        $values['mask_secrets']           = (bool) $values['mask_secrets'];
+        $values['deletion_grace_seconds'] = max(0, (int) $values['deletion_grace_seconds']);
+        $values['id_lifetime']            = max(0, (int) $values['id_lifetime']);
+        $values['webhook_timeout']        = min(30, max(1, (int) $values['webhook_timeout']));
+        $values['webhook_max_attempts']   = min(20, max(1, (int) $values['webhook_max_attempts']));
+
+        // 送信先ホストの許可リスト。小文字に揃え、空の項目は落とす
+        $hosts = is_array($values['webhook_allowed_hosts']) ? $values['webhook_allowed_hosts'] : [];
+        $values['webhook_allowed_hosts'] = array_values(array_filter(
+            array_map(static fn (mixed $host): string => strtolower(trim((string) $host)), $hosts),
+            static fn (string $host): bool => $host !== '',
+        ));
 
         self::$values = $values;
         return self::$values;

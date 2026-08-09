@@ -336,3 +336,7 @@ mv public/admin.php public/admin.rraandoooom.php
 管理パスワードの変更（`admin_password`）とあわせて行い、
 公開サーバーに置く場合は Basic 認証や IP 制限も重ねてください。
 
+## 関連
+
+- [Claude CodeにWebブラウザから使える簡単なドアベルを作ってもらう(PHP版) - ふぁメモ](https://fa.hatenadiary.jp/entry/20260809/1786208516)
+

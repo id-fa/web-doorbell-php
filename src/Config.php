@@ -9,9 +9,17 @@ namespace Doorbell;
 
 final class Config
 {
+    /** 応答ボタンの数の上限（親機のカード表示が3列で組まれているため） */
+    public const MAX_RESPONSES = 3;
+
     /** 設定ファイルが存在しない/項目が欠けている場合に使う既定値 */
     private const DEFAULTS = [
         'polling_interval'       => 10,
+        'responses'              => [
+            'in1'  => ['message' => '1分以内に応対します', 'label' => '1分以内'],
+            'in5'  => ['message' => '5分以内に応対します', 'label' => '5分以内'],
+            'away' => ['message' => '担当者が離席中のため応対できません', 'label' => '離席中'],
+        ],
         'admin_password'         => '1234',
         'admin_session_lifetime' => 1800,
         'max_ids_per_instance'   => 100,
@@ -35,6 +43,7 @@ final class Config
         'webhook_timeout'        => 5,
         'webhook_max_attempts'   => 5,
         'mask_secrets'           => false,
+        'mask_client_ip'         => false,
         'deletion_grace_seconds' => 0,
         'id_lifetime'            => 0,
         'trust_proxy'            => false,
@@ -88,7 +97,9 @@ final class Config
         $values['child_logout_password']  = (bool) $values['child_logout_password'];
         $values['child_link_login']       = (bool) $values['child_link_login'];
         $values['integration_api']        = (bool) $values['integration_api'];
+        $values['responses']              = self::normalizeResponses($values['responses']);
         $values['mask_secrets']           = (bool) $values['mask_secrets'];
+        $values['mask_client_ip']         = (bool) $values['mask_client_ip'];
         $values['deletion_grace_seconds'] = max(0, (int) $values['deletion_grace_seconds']);
         $values['id_lifetime']            = max(0, (int) $values['id_lifetime']);
         $values['webhook_timeout']        = min(30, max(1, (int) $values['webhook_timeout']));
@@ -103,6 +114,53 @@ final class Config
 
         self::$values = $values;
         return self::$values;
+    }
+
+    /**
+     * 応答ボタンの定義を整える。
+     *
+     * 受け付ける書き方は 2 通り。
+     *   'key' => ['message' => '子機に出す文言', 'label' => '短縮ラベル']
+     *   'key' => '子機に出す文言'   // ラベルは文言と同じになる
+     *
+     * 設定が壊れていると親機が応答できなくなるため、使えない項目は落とし、
+     * 1件も残らなければ既定値に戻す。
+     */
+    private static function normalizeResponses(mixed $raw): array
+    {
+        $clean = static fn (string $text, int $limit): string => mb_substr(
+            trim(preg_replace('/[\x00-\x1F\x7F]+/u', '', $text) ?? ''),
+            0,
+            $limit,
+        );
+
+        $result = [];
+        foreach (is_array($raw) ? $raw : [] as $key => $entry) {
+            $key = (string) $key;
+
+            // 'timeout' は不在確定に使っている予約語なので受け付けない
+            if (preg_match('/\A[A-Za-z0-9_]{1,16}\z/', $key) !== 1 || $key === 'timeout') {
+                continue;
+            }
+
+            $message = $clean(is_array($entry) ? (string) ($entry['message'] ?? '') : (string) $entry, 60);
+            if ($message === '') {
+                continue;
+            }
+
+            $label = $clean(is_array($entry) ? (string) ($entry['label'] ?? '') : '', 12);
+            $result[$key] = ['message' => $message, 'label' => $label === '' ? mb_substr($message, 0, 12) : $label];
+
+            if (count($result) >= self::MAX_RESPONSES) {
+                break;
+            }
+        }
+
+        if (count(is_array($raw) ? $raw : []) > self::MAX_RESPONSES) {
+            error_log('doorbell config: responses は ' . self::MAX_RESPONSES . ' 件までです。先頭の分だけを使います。');
+        }
+
+        return $result === [] ? self::DEFAULTS['responses'] : $result;
     }
 
     /**

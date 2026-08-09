@@ -87,7 +87,7 @@ $ps = Doorbell::parentState($parent);
 Doorbell::respond($parent, $ps['activeCalls'][0]['id'], 'away');
 $state = Doorbell::childState($child);
 check('応答ありで履歴が分かれる', count($state['history']) === 2);
-check('応答ありの内容が記録される', ($state['history'][0]['message'] ?? '') === Doorbell::RESPONSES['away']);
+check('応答ありの内容が記録される', ($state['history'][0]['message'] ?? '') === Doorbell::responses()['away']);
 
 echo "== 複数子機からの同時コール ==\n";
 // 上限（既定1台）に関係なく検証したいので、2台目の子機は直接登録する
@@ -407,7 +407,7 @@ $devicesBefore = (int) $pdo->query('SELECT COUNT(*) FROM devices')->fetchColumn(
 Doorbell::respondBy($hookDid, '山田(Slack)', (int) $ms['activeCalls'][0]['id'], 'in1');
 $cs = Doorbell::childState($hookChild);
 check('連携からの応答が子機に届く', ($cs['currentCall']['responder'] ?? '') === '山田(Slack)', json_encode($cs['currentCall'], JSON_UNESCAPED_UNICODE));
-check('応答メッセージはサーバー定義のものになる', ($cs['currentCall']['message'] ?? '') === Doorbell::RESPONSES['in1']);
+check('応答メッセージはサーバー定義のものになる', ($cs['currentCall']['message'] ?? '') === Doorbell::responses()['in1']);
 check(
     '連携からの応答では端末が増えない',
     (int) $pdo->query('SELECT COUNT(*) FROM devices')->fetchColumn() === $devicesBefore,
@@ -474,6 +474,60 @@ check('失効させると送信待ちも消える', $queued() === 0, (string) $q
 Integration::delete($recvOnly['id']);
 check('連携がなくなるとオフライン判定に戻る', Doorbell::childState($hookChild)['parentOnline'] === false);
 
+echo "== 応答ボタンの設定 ==\n";
+// Config は読み込み結果をキャッシュするので、別の設定を読ませてから元に戻す。
+// キャッシュを消すだけで済むよう、書き換えるのは Config::$values だけにする
+$responsesOf = static function (array $config) use ($testConfig): array {
+    $reset = static function (string $path): void {
+        putenv('DOORBELL_CONFIG_PATH=' . $path);
+        (new ReflectionProperty(Config::class, 'values'))->setValue(null, null);
+    };
+
+    $file = sys_get_temp_dir() . '/doorbell-resp-' . getmypid() . '.php';
+    file_put_contents($file, "<?php\nreturn " . var_export(['responses' => $config], true) . ";\n");
+
+    $reset($file);
+    $result = ['messages' => Doorbell::responses(), 'labels' => Doorbell::responseLabels()];
+
+    $reset($testConfig); // 以降のテストは元の設定で動かす
+    @unlink($file);
+
+    return $result;
+};
+
+$custom = $responsesOf([
+    'now'   => ['message' => 'すぐ伺います', 'label' => 'すぐ'],
+    'wait'  => ['message' => '少々お待ちください', 'label' => 'お待ち'],
+    'busy'  => '接客中のため対応できません',
+]);
+check('設定した文言に差し替わる', ($custom['messages']['now'] ?? '') === 'すぐ伺います', json_encode($custom, JSON_UNESCAPED_UNICODE));
+check('設定した短縮ラベルに差し替わる', ($custom['labels']['wait'] ?? '') === 'お待ち', json_encode($custom['labels'] ?? null, JSON_UNESCAPED_UNICODE));
+check('文字列だけの指定も受け付ける', ($custom['messages']['busy'] ?? '') === '接客中のため対応できません');
+check('ラベル省略時は文言を切り詰めて使う', ($custom['labels']['busy'] ?? '') === '接客中のため対応できませ', json_encode($custom['labels'] ?? null, JSON_UNESCAPED_UNICODE));
+check('既定のキーは残らない', !isset($custom['messages']['in1']), json_encode(array_keys($custom['messages'] ?? []), JSON_UNESCAPED_UNICODE));
+
+// 設定が壊れていると親機が応答できなくなるので、使えない指定は落として既定に戻す
+$fallback = $responsesOf(['in1' => '   ']);
+check('空の文言しかなければ既定に戻す', ($fallback['messages']['in1'] ?? '') === '1分以内に応対します', json_encode($fallback, JSON_UNESCAPED_UNICODE));
+
+$reserved = $responsesOf(['timeout' => '予約語', 'ok' => 'わかりました']);
+check('予約語 timeout はキーに使えない', !isset($reserved['messages']['timeout']), json_encode(array_keys($reserved['messages'] ?? []), JSON_UNESCAPED_UNICODE));
+check('残りのキーは使える', ($reserved['messages']['ok'] ?? '') === 'わかりました');
+
+$tooMany = $responsesOf(['a' => 'A', 'b' => 'B', 'c' => 'C', 'd' => 'D']);
+check('上限（3件）を超えた分は使わない', count($tooMany['messages'] ?? []) === Config::MAX_RESPONSES, json_encode($tooMany['messages'] ?? null, JSON_UNESCAPED_UNICODE));
+
+// 設定にないキーでは応答できない（クライアントから任意のキーを送らせない）
+$respId    = Doorbell::issueId('198.51.100.40');
+$respChild = Doorbell::login($respId['doorbell_id'], $respId['child_password'], '通用門', str_repeat('7', 16), '198.51.100.41');
+Doorbell::call($respChild);
+try {
+    Doorbell::respondBy($respId['doorbell_id'], 'x', (int) Doorbell::monitorState($respId['doorbell_id'], 'x', 'integration')['activeCalls'][0]['id'], 'nope');
+    check('設定にないキーでは応答できない', false, '例外が発生しなかった');
+} catch (AppError $e) {
+    check('設定にないキーでは応答できない', $e->errorCode === 'invalid_response', $e->getMessage());
+}
+
 echo "== デモ設置用の表示ヘルパー ==\n";
 // 共用の管理画面に秘匿値をそのまま並べないための伏せ字（復元はできない）
 $token = str_repeat('a', 32);
@@ -485,6 +539,12 @@ check(
     Http::maskUrl('https://hooks.slack.com/services/A/B/C'),
 );
 check('URLでない値も伏せられる', str_contains(Http::maskUrl('not a url'), '伏せ字'));
+
+// IPは「同じ回線かどうか」が分かる程度に前半だけ残す
+check('IPv4は後半2オクテットを伏せる', Http::maskIp('192.0.2.10') === '192.0.x.x', Http::maskIp('192.0.2.10'));
+check('IPv6は上位2ブロックまで', Http::maskIp('2001:db8::1') === '2001:db8:…（以下伏せ字）', Http::maskIp('2001:db8::1'));
+check('短縮表記のIPv6も扱える', Http::maskIp('::1') === '0:0:…（以下伏せ字）', Http::maskIp('::1'));
+check('IPでない値も伏せられる', str_contains(Http::maskIp('unknown'), '伏せ字'), Http::maskIp('unknown'));
 
 check('秒は秒で表示する', Doorbell::duration(45) === '45秒', Doorbell::duration(45));
 check('分と秒をまとめる', Doorbell::duration(90) === '1分30秒', Doorbell::duration(90));

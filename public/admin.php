@@ -59,6 +59,7 @@ $issuedHook  = null;
 $linkEnabled = (bool) Config::get('child_link_login');
 $hookEnabled = Integration::enabled();
 $mask        = (bool) Config::get('mask_secrets');
+$maskIp      = (bool) Config::get('mask_client_ip');
 
 $hadSession = isset($_SESSION['admin_authenticated']);
 $isLoggedIn = adminAuthenticated(); // 失効していれば、ここでセッションから取り除かれる
@@ -185,7 +186,7 @@ header('Cache-Control: no-store');
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
 <title><?= $detail === null ? 'ID発行管理' : 'ID ' . Http::h($detail['doorbell_id']) ?> - ドアベル</title>
-<link rel="stylesheet" href="assets/style.css?v=6">
+<link rel="stylesheet" href="assets/style.css?v=7">
 </head>
 <body>
 <div id="app" class="admin">
@@ -307,7 +308,8 @@ header('Cache-Control: no-store');
 
       <dl class="summary">
         <dt>発行日時</dt><dd><?= Http::h($detail['created_at']) ?></dd>
-        <dt>発行元IP</dt><dd><?= Http::h($detail['created_ip']) ?></dd>
+        <dt>発行元IP</dt>
+        <dd><?= Http::h($maskIp ? Http::maskIp($detail['created_ip']) : $detail['created_ip']) ?></dd>
         <dt>親機</dt><dd><?= $detail['parents'] > 0 ? '稼働中' : '—' ?></dd>
         <dt>子機</dt><dd><?= $detail['children'] > 0 ? '稼働中' : '—' ?></dd>
         <?php if ($detail['expires_in'] !== null): ?>

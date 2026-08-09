@@ -44,7 +44,7 @@ final class Webhook
             'doorbellId' => Doorbell::formatId($doorbellId),
             'occurredAt' => time(),
             'call'       => $call,
-            'responses'  => Doorbell::RESPONSE_LABELS,
+            'responses'  => Doorbell::responseLabels(),
         ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
 
         if ($payload === false) {

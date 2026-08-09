@@ -21,11 +21,13 @@ BASE="${BASE_URL:-}"
 SERVER_PID=""
 LINK_PID=""
 DEMO_PID=""
+RESP_PID=""
 
 cleanup() {
     [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null
     [ -n "$LINK_PID" ] && kill "$LINK_PID" 2>/dev/null
     [ -n "$DEMO_PID" ] && kill "$DEMO_PID" 2>/dev/null
+    [ -n "$RESP_PID" ] && kill "$RESP_PID" 2>/dev/null
     rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -33,6 +35,15 @@ trap cleanup EXIT
 # 検証先が指定されていなければ、一時DBの専用サーバーを起動する
 if [ -z "$BASE" ]; then
     export DOORBELL_DB_PATH="$WORK/doorbell-e2e.sqlite"
+
+    # 設置環境の config/config.php に影響されないよう、既定値だけの一時設定で動かす
+    # （管理パスワードを変えてある環境でもテストが通るようにするため）
+    cat > "$WORK/config.php" <<'PHP'
+<?php
+return [];
+PHP
+    export DOORBELL_CONFIG_PATH="$WORK/config.php"
+
     php -S "127.0.0.1:$PORT" -t "$ROOT/public" > "$WORK/server.log" 2>&1 &
     SERVER_PID=$!
     BASE="http://127.0.0.1:$PORT"
@@ -423,6 +434,7 @@ return [
     'child_link_login'       => true,
     'integration_api'        => true,
     'mask_secrets'           => true,
+    'mask_client_ip'         => true,
     'deletion_grace_seconds' => 600,
     'id_lifetime'            => 3600,
 ];
@@ -482,6 +494,17 @@ PHP
     grep -q 'data-copy="url-' "$WORK/m6.html" && R=0 || R=1
     check "伏せ字のときはコピーボタンを出さない" "$R" ""
 
+    # 発行元IPは後半を伏せる（誰がどのIDを作ったか他の利用者から辿れないようにする）
+    grep -q '<dd>127\.0\.0\.1</dd>' "$WORK/m6.html" && R=0 || R=1
+    check "発行元IPがそのまま出ない" "$R" "$(grep -A1 '発行元IP' "$WORK/m6.html" | tr -d '\n')"
+    grep -q '127\.0\.x\.x' "$WORK/m6.html" && R=1 || R=0
+    check "発行元IPの後半が伏せ字になる" "$R" ""
+
+    # 既定の設定では今までどおり全体を表示する
+    curl -s -b "$WORK/admin.cookie" -o "$WORK/a6.html" "$BASE/admin.php?id=$RAW"
+    grep -q '127\.0\.0\.1' "$WORK/a6.html" && R=1 || R=0
+    check "既定では発行元IPをそのまま表示する" "$R" ""
+
     # 発行直後は削除・失効できない（画面で無効にするだけでなくサーバー側でも拒否する）
     OUT=$(curl -s -b "$WORK/dm.cookie" -d "csrf_token=$MC&action=delete&doorbell_id=$MRAW" "$DBASE/admin.php")
     grep -q '削除・失効できません' <<< "$OUT" && R=1 || R=0
@@ -520,6 +543,71 @@ PHP
 
     kill "$DEMO_PID" 2>/dev/null
     DEMO_PID=""
+
+    echo "== カスタム応答メッセージ =="
+    # 応答ボタンの文言・短縮ラベル・キーを設定で差し替えられる
+    cat > "$WORK/resp_config.php" <<'PHP'
+<?php
+return [
+    'responses' => [
+        'now'  => ['message' => 'すぐ伺います', 'label' => 'すぐ'],
+        'wait' => ['message' => '少々お待ちください', 'label' => 'お待ち'],
+    ],
+];
+PHP
+    RPORT=$((PORT + 3))
+    DOORBELL_CONFIG_PATH="$WORK/resp_config.php" \
+        php -S "127.0.0.1:$RPORT" -t "$ROOT/public" > "$WORK/resp_server.log" 2>&1 &
+    RESP_PID=$!
+    RBASE="http://127.0.0.1:$RPORT"
+    for _ in $(seq 1 50); do
+        curl -s -o /dev/null "$RBASE/index.php" && break
+        sleep 0.2
+    done
+
+    # 画面に渡されるのは設定した文言だけ
+    curl -s -c "$WORK/r.cookie" -o "$WORK/r1.html" "$RBASE/index.php"
+    RC=$(grep -o '"csrfToken":"[a-f0-9]*"' "$WORK/r1.html" | grep -o '[a-f0-9]\{64\}')
+    grep -q '"now":"すぐ伺います"' "$WORK/r1.html" && R=1 || R=0
+    check "設定した応答メッセージが画面に渡る" "$R" ""
+    grep -q '"responseLabels":{"now":"すぐ","wait":"お待ち"}' "$WORK/r1.html" && R=1 || R=0
+    check "設定した短縮ラベルが画面に渡る" "$R" "$(grep -o '"responseLabels":{[^}]*}' "$WORK/r1.html")"
+    grep -q '1分以内に応対します' "$WORK/r1.html" && R=0 || R=1
+    check "既定の応答メッセージは残らない" "$R" ""
+
+    rapi() { # $1=cookieファイル $2=CSRF $3=JSONボディ
+        printf '%s' "$3" > "$WORK/payload.json"
+        curl -s -b "$WORK/$1" -c "$WORK/$1" \
+             -H 'Content-Type: application/json' -H "X-CSRF-Token: $2" \
+             --data-binary "@$WORK/payload.json" "$RBASE/api.php"
+    }
+
+    # 既定のIDはこのサーバーでも使える（DBは共通）
+    curl -s -c "$WORK/rc.cookie" -o "$WORK/r2.html" "$RBASE/index.php"
+    RCC=$(grep -o '"csrfToken":"[a-f0-9]*"' "$WORK/r2.html" | grep -o '[a-f0-9]\{64\}')
+    rapi r.cookie "$RC" "{\"action\":\"login\",\"doorbell_id\":\"$DID\",\"password\":\"$PPW\",\"display_name\":\"$PARENT_NAME\",\"device_key\":\"aaaaaaaaaaaaaaaa\"}" > /dev/null
+    rapi rc.cookie "$RCC" "{\"action\":\"login\",\"doorbell_id\":\"$DID\",\"password\":\"$CPW\",\"display_name\":\"$CHILD_NAME\",\"device_key\":\"bbbbbbbbbbbbbbbb\"}" > /dev/null
+    OUT=$(rapi rc.cookie "$RCC" '{"action":"call"}')
+    RCALL=$(grep -o '"currentCall":{"id":[0-9]*' <<< "$OUT" | grep -o '[0-9]*$')
+
+    OUT=$(rapi r.cookie "$RC" "{\"action\":\"respond\",\"call_id\":$RCALL,\"response\":\"in1\"}")
+    grep -q 'invalid_response' <<< "$OUT" && R=1 || R=0
+    check "設定から外したキーでは応答できない" "$R" "$OUT"
+
+    OUT=$(rapi r.cookie "$RC" "{\"action\":\"respond\",\"call_id\":$RCALL,\"response\":\"now\"}")
+    grep -q '"activeCalls":\[\]' <<< "$OUT" && R=1 || R=0
+    check "設定したキーで応答できる" "$R" "$OUT"
+
+    OUT=$(rapi rc.cookie "$RCC" '{"action":"state"}')
+    grep -q 'すぐ伺います' <<< "$OUT" && R=1 || R=0
+    check "子機に設定した文言が届く" "$R" "$OUT"
+
+    # 枠を解放して後続のテストへ戻す
+    rapi r.cookie "$RC" '{"action":"logout"}' > /dev/null
+    rapi rc.cookie "$RCC" "{\"action\":\"logout\",\"password\":\"$CPW\"}" > /dev/null
+
+    kill "$RESP_PID" 2>/dev/null
+    RESP_PID=""
 fi
 
 echo "== 端末キーの使い回しによる同時接続上限の回避 =="

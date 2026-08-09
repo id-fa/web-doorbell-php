@@ -339,9 +339,11 @@ button:focus-visible {
 
 .call-card.is-urgent .call-card-remaining strong { color: var(--danger); }
 
+/* 応答ボタンは設定で 1〜3 件に変えられるので、件数に合わせて幅を分ける */
 .call-card-actions {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-auto-flow: column;
+  grid-auto-columns: 1fr;
   gap: 8px;
 }
 

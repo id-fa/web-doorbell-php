@@ -213,4 +213,34 @@ final class Http
 
         return ($parts['scheme'] ?? 'https') . '://' . $parts['host'] . '/…（以下伏せ字）';
     }
+
+    /**
+     * IPアドレスの後半を伏せる（`mask_client_ip` 用）。
+     *
+     * 個々の利用者を特定できないようにしつつ、「同じ回線か違う回線か」は
+     * 見分けられる程度に前半を残す。
+     * IPv4 は上位2オクテット、IPv6 は上位2ブロックまで。
+     */
+    public static function maskIp(string $ip): string
+    {
+        if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) !== false) {
+            $octets = explode('.', $ip);
+
+            return $octets[0] . '.' . $octets[1] . '.x.x';
+        }
+
+        if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6) !== false) {
+            // 「::」の短縮表記があると文字列を割っても位置が合わないので、
+            // 16バイトに展開してから先頭2ブロック（4バイト）を取り出す
+            $hex    = bin2hex((string) inet_pton($ip));
+            $blocks = array_map(
+                static fn (string $block): string => ltrim($block, '0') ?: '0',
+                [substr($hex, 0, 4), substr($hex, 4, 4)],
+            );
+
+            return implode(':', $blocks) . ':…（以下伏せ字）';
+        }
+
+        return self::mask($ip, 3);
+    }
 }

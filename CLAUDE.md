@@ -42,10 +42,11 @@ php -r "require 'src/bootstrap.php'; use Doorbell\Doorbell; print_r(Doorbell::is
 DB の場所は環境変数 `DOORBELL_DB_PATH`、設定ファイルの場所は `DOORBELL_CONFIG_PATH` で
 上書きできる（`Config::load()` が解釈する）。これは CLI と組み込みサーバー
 （SAPI が `cli` / `cli-server`）でのみ有効。php-fpm 等の本番 SAPI では無視される。
-`logic_test.php` は設置環境の `config/config.php` に影響されないよう、一時 config を書いて
-`DOORBELL_CONFIG_PATH` で差し替えている（既定値＋外部連携を有効にしたもの）。
-HTTP 経由で既定と違う設定を検証したいときは、`e2e_test.sh` の子機URL／外部連携のブロックのように
-一時 config を書いて別ポートにサーバーを立てる。
+**テストは設置環境の `config/config.php` を読まない。** `logic_test.php` も `e2e_test.sh` も
+一時 config を書いて `DOORBELL_CONFIG_PATH` で差し替える（管理パスワードを変更した環境でも
+そのまま通るようにするため）。テストが前提とする設定を増やすときは、この一時 config に書く。
+HTTP 経由で既定と違う設定を検証したいときは、`e2e_test.sh` の子機URL／外部連携／デモ設置用の
+ブロックのように、一時 config を書いて別ポートにサーバーを立てる。
 
 ブラウザで手動確認するときの注意:
 
@@ -160,8 +161,12 @@ WHERE created_at <= :deadline
 - `public/assets/*` を編集したら `index.php` / `admin.php` の `?v=N` を上げる
 - `api.php` は POST + `X-CSRF-Token` ヘッダ必須。CSRF トークンは `index.php` が
   `#bootstrap-data` の JSON で渡す
-- 応答メッセージはキー（`in1` / `in5` / `away`）だけを受け取り、文言はサーバーの
-  `Doorbell::RESPONSES` を使う。クライアントから任意の文字列を送らせない
+- **応答ボタンは設定 `responses` で決まる**（既定は `in1` / `in5` / `away` の3件）。
+  クライアントからはキーだけを受け取り、文言は `Doorbell::responses()` を使う。
+  キーを固定値として書かないこと。`Config::normalizeResponses()` が件数・文字数・
+  予約語（`timeout`）を検証し、使える定義が1件も残らなければ既定に戻す
+  （設定ミスで親機が応答できなくなるのを避けるため）。
+  親機のカード表示は `grid-auto-flow: column` で件数に追従する
 - 設定項目を増やすときは `Config::DEFAULTS` と `config/config.sample.php` の両方に追加する。
   クライアントに渡す必要があるものだけ `Config::publicValues()` に載せる（秘匿値を混ぜない）
 - 通知先URLは **https と `webhook_allowed_hosts` に限定**し、リダイレクトも追わない。
@@ -171,9 +176,9 @@ WHERE created_at <= :deadline
   `disabled` にするだけでは、フォームを直接送れば消せてしまう。判定は
   `Doorbell::guardDeletion()` に集約してあり、`deleteId()` / `deleteChildLink()` /
   `Integration::delete()` の 3 か所から呼ぶ。削除系を増やすときはここも通すこと
-- **伏せ字（`mask_secrets`）は表示だけの機能。** モデル側は生の値を返し、
-  `admin.php` が `Http::mask()` / `Http::maskUrl()` を通して出す。伏せた値は
-  復元できないので、コピーボタンも一緒に隠す
+- **伏せ字（`mask_secrets` / `mask_client_ip`）は表示だけの機能。** モデル側は生の値を返し、
+  `admin.php` が `Http::mask()` / `Http::maskUrl()` / `Http::maskIp()` を通して出す。
+  伏せた値は復元できないので、コピーボタンも一緒に隠す
 - `examples/` はサンプルコード置き場。テストの対象外で、公開ディレクトリの外に置く
   （`.htaccess` とリポジトリ直下の `.htaccess` の両方で遮断している）
 - `config/config.php` は `.gitignore` 済み。既定の管理パスワードは `1234` のまま

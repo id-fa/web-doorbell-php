@@ -11,19 +11,28 @@ use PDO;
 
 final class Doorbell
 {
-    /** 親機の応答ボタン（キー => 子機へ送るメッセージ） */
-    public const RESPONSES = [
-        'in1'  => '1分以内に応対します',
-        'in5'  => '5分以内に応対します',
-        'away' => '担当者が離席中のため応対できません',
-    ];
+    /**
+     * 親機の応答ボタン（キー => 子機へ送るメッセージ）。設定 `responses` で差し替えられる。
+     *
+     * クライアントには index.php がこの内容を渡し、キーだけを送り返させる。
+     * 文言をクライアントから受け取らないのは、任意の文字列を子機に表示させないため。
+     */
+    public static function responses(): array
+    {
+        return array_map(
+            static fn (array $entry): string => $entry['message'],
+            (array) Config::get('responses'),
+        );
+    }
 
     /** 複数の呼び出しを並べて表示するときに使う短縮ラベル */
-    public const RESPONSE_LABELS = [
-        'in1'  => '1分以内',
-        'in5'  => '5分以内',
-        'away' => '離席中',
-    ];
+    public static function responseLabels(): array
+    {
+        return array_map(
+            static fn (array $entry): string => $entry['label'],
+            (array) Config::get('responses'),
+        );
+    }
 
     /** 不在判定時に子機へ送るメッセージ */
     public const NO_ANSWER_MESSAGE = '応答がありません。不在のようです。';
@@ -663,7 +672,8 @@ final class Doorbell
         int $callId,
         string $responseKey,
     ): array {
-        if (!isset(self::RESPONSES[$responseKey])) {
+        $responses = self::responses();
+        if (!isset($responses[$responseKey])) {
             throw new AppError('不正な応答です。', 'invalid_response');
         }
 
@@ -683,7 +693,7 @@ final class Doorbell
             ':now'      => $now,
             ':name'     => $responderName,
             ':key'      => $responseKey,
-            ':message'  => self::RESPONSES[$responseKey],
+            ':message'  => $responses[$responseKey],
             ':id'       => $callId,
             ':doorbell' => $doorbellId,
         ]);

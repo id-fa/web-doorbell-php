@@ -104,6 +104,6 @@ function state(string $doorbellId, string $label): array
 {
     return [
         ...Doorbell::monitorState($doorbellId, $label, 'integration'),
-        'responses' => Doorbell::RESPONSE_LABELS,
+        'responses' => Doorbell::responseLabels(),
     ];
 }

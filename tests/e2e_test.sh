@@ -23,6 +23,7 @@ LINK_PID=""
 DEMO_PID=""
 RESP_PID=""
 NAME_PID=""
+VOICE_PID=""
 RENAMED="" # 管理画面のリネーム検証で public/ に一時的に置くコピー
 
 cleanup() {
@@ -31,6 +32,7 @@ cleanup() {
     [ -n "$DEMO_PID" ] && kill "$DEMO_PID" 2>/dev/null
     [ -n "$RESP_PID" ] && kill "$RESP_PID" 2>/dev/null
     [ -n "$NAME_PID" ] && kill "$NAME_PID" 2>/dev/null
+    [ -n "$VOICE_PID" ] && kill "$VOICE_PID" 2>/dev/null
     [ -n "$RENAMED" ] && rm -f "$ROOT/public/$RENAMED"
     rm -rf "$WORK"
 }
@@ -719,6 +721,132 @@ for i in $(seq 1 15); do
 done
 [ "$LIMITED" -gt 0 ] && R=1 || R=0
 check "メイン画面のログイン試行がレート制限される" "$R" "15回試行しても制限されなかった"
+
+OUT=$(api parent.cookie "$PC" '{"action":"voice_start","call_id":1,"sdp":{"type":"offer","sdp":"v=0"}}')
+grep -q 'voice_disabled' <<< "$OUT" && R=1 || R=0
+check "既定では通話を開始できない" "$R" "$OUT"
+
+if [ -n "$SERVER_PID" ]; then
+    # 通話（テスト版機能）。既定で無効なので専用サーバーを立てる。
+    # WebRTC 本体（getUserMedia / ICE）はブラウザがないと動かないため、
+    # ここで確かめるのはシグナリングの受け渡しと呼び出しの決着だけ。
+    cat > "$WORK/voice_config.php" <<'PHP'
+<?php
+return [
+    'voice_call' => true,
+    // DB もレート制限の集計も他のサーバーと共有しているため、
+    // ここまでの検証で使った分に引っかからないよう上限を緩めておく
+    'max_ids_per_ip' => 100,
+    'rate_limit'     => ['max_requests' => 3000, 'max_logins' => 1000, 'max_calls' => 1000],
+];
+PHP
+    VPORT=$((PORT + 5))
+    DOORBELL_CONFIG_PATH="$WORK/voice_config.php" \
+        php -S "127.0.0.1:$VPORT" -t "$ROOT/public" > "$WORK/voice_server.log" 2>&1 &
+    VOICE_PID=$!
+    VBASE="http://127.0.0.1:$VPORT"
+    for _ in $(seq 1 50); do
+        curl -s -o /dev/null "$VBASE/index.php" && break
+        sleep 0.2
+    done
+
+    vapi() { # $1=cookieファイル $2=CSRFトークン $3=JSONボディ
+        printf '%s' "$3" > "$WORK/payload.json"
+        curl -s -b "$WORK/$1" -c "$WORK/$1" \
+             -H 'Content-Type: application/json' -H "X-CSRF-Token: $2" \
+             --data-binary "@$WORK/payload.json" "$VBASE/api.php"
+    }
+
+    echo "== 通話（テスト版機能） =="
+
+    # 既定のIDには別サーバーの親機・子機が居座っているので、専用のIDを発行する
+    curl -s -c "$WORK/va.cookie" -o "$WORK/va1.html" "$VBASE/admin.php"
+    VA=$(csrf_of "$WORK/va1.html")
+    curl -s -b "$WORK/va.cookie" -c "$WORK/va.cookie" -o "$WORK/va2.html" \
+         -d "csrf_token=$VA&action=login&password=1234" "$VBASE/admin.php"
+    VA=$(csrf_of "$WORK/va2.html")
+    curl -s -b "$WORK/va.cookie" -c "$WORK/va.cookie" -o "$WORK/va3.html" \
+         -d "csrf_token=$VA&action=issue" "$VBASE/admin.php"
+    VCREDS=$(grep -o '<dd>[^<]*</dd>' "$WORK/va3.html" | sed 's/<dd>//; s|</dd>||')
+    VID=$(echo "$VCREDS" | sed -n 1p)
+    VPPW=$(echo "$VCREDS" | sed -n 2p)
+    VCPW=$(echo "$VCREDS" | sed -n 3p)
+
+    curl -s -c "$WORK/vp.cookie" -o "$WORK/vp1.html" "$VBASE/index.php"
+    VPC=$(grep -o '"csrfToken":"[a-f0-9]*"' "$WORK/vp1.html" | grep -o '[a-f0-9]\{64\}')
+    curl -s -c "$WORK/vc.cookie" -o "$WORK/vc1.html" "$VBASE/index.php"
+    VCC=$(grep -o '"csrfToken":"[a-f0-9]*"' "$WORK/vc1.html" | grep -o '[a-f0-9]\{64\}')
+
+    { [ -n "$VID" ] && [ -n "$VPPW" ] && [ -n "$VCPW" ]; } && R=1 || R=0
+    check "通話の検証用にIDを発行できる" "$R" "$VCREDS"
+
+    grep -q '"voiceCall":true' "$WORK/vp1.html" && R=1 || R=0
+    check "通話の設定が画面に渡る" "$R" ""
+
+    grep -q 'assets/voice.js' "$WORK/vp1.html" && R=1 || R=0
+    check "通話のスクリプトが読み込まれる" "$R" ""
+
+    vapi vp.cookie "$VPC" "{\"action\":\"login\",\"doorbell_id\":\"$VID\",\"password\":\"$VPPW\",\"display_name\":\"受付\",\"device_key\":\"vvvvvvvvvvvvvvvv\"}" > /dev/null
+    vapi vc.cookie "$VCC" "{\"action\":\"login\",\"doorbell_id\":\"$VID\",\"password\":\"$VCPW\",\"display_name\":\"玄関\",\"device_key\":\"wwwwwwwwwwwwwwww\"}" > /dev/null
+
+    OUT=$(vapi vc.cookie "$VCC" '{"action":"call"}')
+    VCALL=$(grep -o '"activeCalls":\[{"id":[0-9]*' <<< "$(vapi vp.cookie "$VPC" '{"action":"state"}')" | grep -o '[0-9]*$')
+    [ -n "$VCALL" ] && R=1 || R=0
+    check "呼び出しを立てられる" "$R" "$OUT"
+
+    # 子機は親機のみが通話を開始できる
+    OUT=$(vapi vc.cookie "$VCC" "{\"action\":\"voice_start\",\"call_id\":$VCALL,\"sdp\":{\"type\":\"offer\",\"sdp\":\"v=0\"}}")
+    grep -q 'forbidden' <<< "$OUT" && R=1 || R=0
+    check "子機からは通話を開始できない" "$R" "$OUT"
+
+    OUT=$(vapi vp.cookie "$VPC" "{\"action\":\"voice_start\",\"call_id\":$VCALL,\"sdp\":{\"type\":\"offer\",\"sdp\":\"v=0 offer\"}}")
+    VSESS=$(grep -o '"session":{"id":[0-9]*' <<< "$OUT" | grep -o '[0-9]*$')
+    [ -n "$VSESS" ] && R=1 || R=0
+    check "親機から通話を開始できる" "$R" "$OUT"
+
+    OUT=$(vapi vp.cookie "$VPC" '{"action":"state"}')
+    grep -q '"status":"waiting"' <<< "$OUT" && R=1 || R=0
+    check "通話の接続待ちのあいだ呼び出しは応答待ちのまま" "$R" "$OUT"
+
+    OUT=$(vapi vc.cookie "$VCC" '{"action":"voice_poll"}')
+    grep -q '"kind":"offer"' <<< "$OUT" && R=1 || R=0
+    check "子機がセッションIDなしで offer を受け取る" "$R" "$OUT"
+
+    OUT=$(vapi vc.cookie "$VCC" "{\"action\":\"voice_poll\",\"session_id\":$VSESS}")
+    grep -q '"signals":\[\]' <<< "$OUT" && R=1 || R=0
+    check "配送済みの offer は二度届かない" "$R" "$OUT"
+
+    OUT=$(vapi vc.cookie "$VCC" "{\"action\":\"voice_signal\",\"session_id\":$VSESS,\"kind\":\"answer\",\"payload\":{\"type\":\"answer\",\"sdp\":\"v=0 answer\"}}")
+    grep -q '"ok":true' <<< "$OUT" && R=1 || R=0
+    check "子機から answer を返せる" "$R" "$OUT"
+
+    OUT=$(vapi vp.cookie "$VPC" "{\"action\":\"voice_poll\",\"session_id\":$VSESS}")
+    grep -q '"kind":"answer"' <<< "$OUT" && R=1 || R=0
+    check "親機に answer が届く" "$R" "$OUT"
+
+    OUT=$(vapi vp.cookie "$VPC" "{\"action\":\"voice_connected\",\"session_id\":$VSESS}")
+    grep -q '"status":"connected"' <<< "$OUT" && R=1 || R=0
+    check "接続成立を記録できる" "$R" "$OUT"
+
+    grep -q 'ここから通話します' <<< "$OUT" && R=1 || R=0
+    check "接続成立で呼び出しが通話の応答として決着する" "$R" "$OUT"
+
+    OUT=$(vapi vp.cookie "$VPC" "{\"action\":\"voice_end\",\"session_id\":$VSESS,\"reason\":\"hangup\"}")
+    grep -q '"ok":true' <<< "$OUT" && R=1 || R=0
+    check "通話を終了できる" "$R" "$OUT"
+
+    OUT=$(vapi vp.cookie "$VPC" "{\"action\":\"voice_poll\",\"session_id\":$VSESS}")
+    grep -q '"status":"ended"' <<< "$OUT" && R=1 || R=0
+    check "終了した通話は ended として返る" "$R" "$OUT"
+
+    # SDP は相手のブラウザに渡るので、当事者以外が割り込めてはいけない
+    OUT=$(vapi va.cookie "$VA" "{\"action\":\"voice_poll\",\"session_id\":$VSESS}")
+    grep -qE 'unauthenticated|csrf' <<< "$OUT" && R=1 || R=0
+    check "ログインしていない相手は通話を覗けない" "$R" "$OUT"
+
+    kill "$VOICE_PID" 2>/dev/null
+    VOICE_PID=""
+fi
 
 echo "== 非公開ファイルの秘匿 =="
 for path in config/config.php data/doorbell.sqlite src/Doorbell.php; do

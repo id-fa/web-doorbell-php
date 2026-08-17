@@ -40,7 +40,7 @@ header('Referrer-Policy: same-origin');
 <meta name="theme-color" content="#1f2937">
 <meta name="robots" content="noindex, nofollow">
 <title>ドアベル</title>
-<link rel="stylesheet" href="assets/style.css?v=7">
+<link rel="stylesheet" href="assets/style.css?v=8">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🔔</text></svg>">
 </head>
 <body>
@@ -110,6 +110,8 @@ header('Referrer-Policy: same-origin');
       <p class="repeat" id="parent-repeat" hidden></p>
       <p class="countdown">応答待ち <span id="parent-countdown">--</span> 秒</p>
       <div class="responses" id="parent-responses"></div>
+      <!-- 通話ボタンは responses の 3 列グリッドの外に置く（件数に追従させないため） -->
+      <div class="voice-launch" id="parent-voice" hidden></div>
     </div>
 
     <!-- 呼び出しが2件以上のとき -->
@@ -122,6 +124,21 @@ header('Referrer-Policy: same-origin');
     <div class="stage" id="parent-answered" hidden>
       <p class="stage-title">応答を送信しました</p>
       <p class="stage-sub" id="parent-answered-message"></p>
+    </div>
+
+    <!-- 通話中（テスト版機能） -->
+    <div class="stage stage-talk" id="parent-talking" hidden>
+      <p class="stage-title" id="parent-talk-title">接続しています…</p>
+      <p class="stage-sub" id="parent-talk-peer"></p>
+      <div class="talk-video-frame">
+        <video id="voice-remote-video" playsinline autoplay></video>
+        <p class="talk-video-empty" id="parent-talk-novideo">映像なし</p>
+      </div>
+      <p class="countdown" id="parent-talk-clock">通話時間 <span id="parent-talk-elapsed">0:00</span></p>
+      <div class="talk-actions">
+        <button type="button" class="btn btn-quiet" id="voice-mute">自分の音声を切る</button>
+        <button type="button" class="btn btn-danger" id="voice-hangup">通話を終える</button>
+      </div>
     </div>
   </section>
 
@@ -152,6 +169,7 @@ header('Referrer-Policy: same-origin');
       <div class="pulse" aria-hidden="true">🔔</div>
       <p class="stage-title">呼び出し中…</p>
       <p class="stage-sub" id="child-waiting-sub">応答をお待ちください</p>
+      <p class="notice notice-info" id="child-voice-armed" hidden>通話に備えてマイクとカメラが有効になっています</p>
       <p class="countdown">残り <span id="child-countdown">--</span> 秒</p>
     </div>
 
@@ -160,6 +178,20 @@ header('Referrer-Policy: same-origin');
       <p class="answer-message" id="child-answer-message"></p>
       <p class="stage-sub" id="child-auto-return"></p>
       <button type="button" class="btn btn-primary" id="child-back">TOPに戻る</button>
+    </div>
+
+    <!-- 通話中（テスト版機能）。子機は自動で応じるので、操作は切断だけ -->
+    <div class="stage stage-talk" id="child-talking" hidden>
+      <p class="stage-title">通話中</p>
+      <p class="stage-sub" id="child-talk-peer"></p>
+      <div class="talk-self-frame" id="child-talk-self" hidden>
+        <video id="voice-local-preview" playsinline autoplay muted></video>
+      </div>
+      <audio id="voice-remote-audio" autoplay></audio>
+      <p class="countdown" id="child-talk-clock">通話時間 <span id="child-talk-elapsed">0:00</span></p>
+      <div class="talk-actions">
+        <button type="button" class="btn btn-danger" id="child-voice-hangup">通話を終える</button>
+      </div>
     </div>
   </section>
 
@@ -200,6 +232,7 @@ header('Referrer-Policy: same-origin');
     $bootstrapData,
     JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT,
 ) ?></script>
-<script src="assets/app.js?v=5"></script>
+<script src="assets/voice.js?v=1"></script>
+<script src="assets/app.js?v=6"></script>
 </body>
 </html>

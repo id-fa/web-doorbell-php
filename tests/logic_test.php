@@ -21,6 +21,8 @@ file_put_contents($testConfig, "<?php\nreturn " . var_export([
     'webhook_allowed_hosts' => ['hooks.slack.com', '127.0.0.1'],
     'webhook_timeout'       => 1,
     'webhook_max_attempts'  => 3,
+    // 通話も既定では無効なので、ここだけ有効にする
+    'voice_call'            => true,
 ], true) . ";\n");
 putenv('DOORBELL_CONFIG_PATH=' . $testConfig);
 
@@ -40,6 +42,7 @@ use Doorbell\Database;
 use Doorbell\Doorbell;
 use Doorbell\Http;
 use Doorbell\Integration;
+use Doorbell\Voice;
 use Doorbell\Webhook;
 
 $pass = 0;
@@ -474,6 +477,170 @@ check('失効させると送信待ちも消える', $queued() === 0, (string) $q
 Integration::delete($recvOnly['id']);
 check('連携がなくなるとオフライン判定に戻る', Doorbell::childState($hookChild)['parentOnline'] === false);
 
+echo "== 通話（テスト版機能） ==\n";
+$vid     = Doorbell::issueId('192.0.2.60');
+$vparent = Doorbell::login($vid['doorbell_id'], $vid['parent_password'], '受付', str_repeat('m', 16), '192.0.2.60');
+$vchild  = Doorbell::login($vid['doorbell_id'], $vid['child_password'], '玄関', str_repeat('n', 16), '192.0.2.61');
+
+$offer  = ['type' => 'offer', 'sdp' => 'v=0 o=- 1 1 IN IP4 127.0.0.1'];
+$answer = ['type' => 'answer', 'sdp' => 'v=0 o=- 2 2 IN IP4 127.0.0.1'];
+
+// クライアントに返さない列も確かめたいので、セッションの行を直接見る
+$voiceRow = static function (int $sessionId) use ($pdo): array {
+    $stmt = $pdo->prepare('SELECT * FROM voice_sessions WHERE id = :id');
+    $stmt->execute([':id' => $sessionId]);
+
+    return (array) $stmt->fetch();
+};
+
+// 呼び出しを立ててから通話を始める
+$startVoice = static function () use ($vchild, $vparent, $offer): array {
+    Doorbell::call($vchild);
+    $callId = Doorbell::parentState($vparent)['activeCalls'][0]['id'];
+
+    return [Voice::start($vparent, $callId, $offer), $callId];
+};
+
+[$session, $callId] = $startVoice();
+check('通話を開始できる', ($session['status'] ?? '') === 'offering', json_encode($session, JSON_UNESCAPED_UNICODE));
+check('開始しただけでは呼び出しは応答待ちのまま', Doorbell::parentState($vparent)['activeCalls'][0]['status'] === 'waiting');
+check('親機の state に通話が載る', (Doorbell::parentState($vparent)['voice']['id'] ?? 0) === $session['id']);
+check('子機の state にも同じ通話が載る', (Doorbell::childState($vchild)['voice']['id'] ?? 0) === $session['id']);
+check('相手の名前が見える', (Doorbell::childState($vchild)['voice']['peerName'] ?? '') === '受付');
+
+// 子機はセッションIDを知らないまま着信に気づく必要がある
+$inbox = Voice::poll($vchild);
+check('子機がセッションIDなしで着信を見つける', ($inbox['session']['id'] ?? 0) === $session['id']);
+check('子機に offer が届く', count($inbox['signals']) === 1 && $inbox['signals'][0]['kind'] === 'offer');
+check('offer の中身が保たれる', ($inbox['signals'][0]['payload']['sdp'] ?? '') === $offer['sdp']);
+check('配送済みのシグナルは消える', Voice::poll($vchild, $session['id'])['signals'] === []);
+check('自分が出したシグナルは自分に返らない', Voice::poll($vparent, $session['id'])['signals'] === []);
+
+// SDP は相手のブラウザにそのまま渡るので、当事者以外が触れてはいけない
+try {
+    Voice::poll($parent, $session['id']);
+    check('別のIDの端末はセッションを覗けない', false, '例外が発生しなかった');
+} catch (AppError $e) {
+    check('別のIDの端末はセッションを覗けない', $e->errorCode === 'forbidden', $e->errorCode);
+}
+
+try {
+    Voice::signal($parent, $session['id'], 'ice', ['candidate' => 'candidate:1 1 udp 1 127.0.0.1 1 typ host']);
+    check('別のIDの端末はシグナルを送れない', false, '例外が発生しなかった');
+} catch (AppError $e) {
+    check('別のIDの端末はシグナルを送れない', $e->errorCode === 'forbidden', $e->errorCode);
+}
+
+// offer を出すのは常に親機なので、answer を返せるのは子機だけ
+try {
+    Voice::signal($vparent, $session['id'], 'answer', $answer);
+    check('親機は answer を返せない', false, '例外が発生しなかった');
+} catch (AppError $e) {
+    check('親機は answer を返せない', $e->errorCode === 'forbidden', $e->errorCode);
+}
+
+Voice::signal($vchild, $session['id'], 'answer', $answer);
+$inbox = Voice::poll($vparent, $session['id']);
+check('answer で応答済みになる', ($inbox['session']['status'] ?? '') === 'answered', json_encode($inbox['session'] ?? null));
+check('親機に answer が届く', ($inbox['signals'][0]['kind'] ?? '') === 'answer');
+
+Voice::signal($vparent, $session['id'], 'ice', ['candidate' => 'candidate:1 1 udp 1 127.0.0.1 1 typ host']);
+check('ICE は双方向に流れる', (Voice::poll($vchild, $session['id'])['signals'][0]['kind'] ?? '') === 'ice');
+
+try {
+    Voice::signal($vchild, $session['id'], 'ice', ['candidate' => str_repeat('x', 20000)]);
+    check('大きすぎるシグナルは拒否される', false, '例外が発生しなかった');
+} catch (AppError $e) {
+    check('大きすぎるシグナルは拒否される', $e->errorCode === 'invalid_input', $e->errorCode);
+}
+
+try {
+    Voice::start($vparent, $callId, $offer);
+    check('同じIDで通話を二重に始められない', false, '例外が発生しなかった');
+} catch (AppError $e) {
+    check('同じIDで通話を二重に始められない', $e->errorCode === 'voice_busy', $e->errorCode);
+}
+
+// 接続の成立を伝えて初めて呼び出しが決着する
+$connected = Voice::connected($vparent, $session['id']);
+check('接続成立で通話中になる', ($connected['status'] ?? '') === 'connected', json_encode($connected, JSON_UNESCAPED_UNICODE));
+
+$after = Doorbell::childState($vchild);
+check('通話成立で呼び出しが応答済みになる', ($after['currentCall']['status'] ?? '') === 'answered');
+check('通話の文言が子機に届く', ($after['currentCall']['message'] ?? '') === Config::get('voice_call_message'));
+check('通話の応答者が記録される', ($after['currentCall']['responder'] ?? '') === '受付');
+check('二度目の接続通知でも壊れない', (Voice::connected($vparent, $session['id'])['status'] ?? '') === 'connected');
+
+// 通話は組み込みの応答なので、設定の応答を通る経路（外部連携を含む）からは使えない
+try {
+    Doorbell::respondBy($vid['doorbell_id'], 'Slack', $callId, 'talk');
+    check('通常の応答経路では talk を使えない', false, '例外が発生しなかった');
+} catch (AppError $e) {
+    check('通常の応答経路では talk を使えない', $e->errorCode === 'invalid_response', $e->errorCode);
+}
+
+Voice::end($vchild, $session['id'], 'hangup');
+check('子機からも通話を終了できる', ($voiceRow($session['id'])['status'] ?? '') === 'ended');
+check('終了した通話は state から消える', Doorbell::parentState($vparent)['voice'] === null);
+check('終了時に未配送のシグナルも消える', (int) $pdo->query('SELECT COUNT(*) FROM voice_signals')->fetchColumn() === 0);
+
+// --- 期限切れの判定（cron がないのでポーリング時に評価される） ---
+
+[$session, $callId] = $startVoice();
+$pdo->exec('UPDATE voice_sessions SET created_at = created_at - '
+    . (Config::int('voice_connect_timeout') + 5) . ' WHERE id = ' . $session['id']);
+Voice::expireSessions($vid['doorbell_id']);
+check('確立できないまま時間切れになる', ($voiceRow($session['id'])['end_reason'] ?? '') === 'timeout', json_encode($voiceRow($session['id'])));
+check('通話に失敗しても呼び出しは応答待ちのまま', Doorbell::parentState($vparent)['activeCalls'][0]['status'] === 'waiting');
+
+// 失敗しても通常の応答を選び直せることが、この設計の要点
+Doorbell::respond($vparent, $callId, 'in1');
+check('通話に失敗した後も通常の応答を選び直せる', (Doorbell::childState($vchild)['currentCall']['message'] ?? '') === Doorbell::responses()['in1']);
+
+[$session, $callId] = $startVoice();
+$pdo->exec('UPDATE voice_sessions SET child_seen_at = child_seen_at - '
+    . (Config::int('voice_stale_seconds') + 5) . ' WHERE id = ' . $session['id']);
+Voice::expireSessions($vid['doorbell_id']);
+check('相手のポーリングが途絶えたら切断する', ($voiceRow($session['id'])['end_reason'] ?? '') === 'lost', json_encode($voiceRow($session['id'])));
+
+[$session, $callId] = $startVoice();
+Voice::signal($vchild, $session['id'], 'answer', $answer);
+Voice::connected($vparent, $session['id']);
+$pdo->exec('UPDATE voice_sessions SET connected_at = connected_at - '
+    . (Config::int('voice_max_seconds') + 5) . ' WHERE id = ' . $session['id']);
+Voice::expireSessions($vid['doorbell_id']);
+check('通話時間の上限で終了する', ($voiceRow($session['id'])['end_reason'] ?? '') === 'max_time', json_encode($voiceRow($session['id'])));
+
+// --- 機能を無効にしたとき ---
+$withVoiceOff = static function (callable $body) use ($testConfig): void {
+    $reset = static function (string $path): void {
+        putenv('DOORBELL_CONFIG_PATH=' . $path);
+        (new ReflectionProperty(Config::class, 'values'))->setValue(null, null);
+    };
+
+    $file = sys_get_temp_dir() . '/doorbell-voice-off-' . getmypid() . '.php';
+    file_put_contents($file, "<?php\nreturn " . var_export(['voice_call' => false], true) . ";\n");
+
+    $reset($file);
+    try {
+        $body();
+    } finally {
+        $reset($testConfig); // 以降のテストは元の設定で動かす
+        @unlink($file);
+    }
+};
+
+$withVoiceOff(static function () use ($vparent, $vchild, $offer): void {
+    try {
+        Voice::start($vparent, 0, $offer);
+        check('無効なら通話を開始できない', false, '例外が発生しなかった');
+    } catch (AppError $e) {
+        check('無効なら通話を開始できない', $e->errorCode === 'voice_disabled', $e->errorCode);
+    }
+
+    check('無効なら state に通話が載らない', Doorbell::childState($vchild)['voice'] === null);
+});
+
 echo "== 応答ボタンの設定 ==\n";
 // Config は読み込み結果をキャッシュするので、別の設定を読ませてから元に戻す。
 // キャッシュを消すだけで済むよう、書き換えるのは Config::$values だけにする
@@ -510,8 +677,10 @@ check('既定のキーは残らない', !isset($custom['messages']['in1']), json
 $fallback = $responsesOf(['in1' => '   ']);
 check('空の文言しかなければ既定に戻す', ($fallback['messages']['in1'] ?? '') === '1分以内に応対します', json_encode($fallback, JSON_UNESCAPED_UNICODE));
 
-$reserved = $responsesOf(['timeout' => '予約語', 'ok' => 'わかりました']);
+$reserved = $responsesOf(['timeout' => '予約語', 'talk' => '通話予約語', 'ok' => 'わかりました']);
 check('予約語 timeout はキーに使えない', !isset($reserved['messages']['timeout']), json_encode(array_keys($reserved['messages'] ?? []), JSON_UNESCAPED_UNICODE));
+// 通話は組み込みの応答なので、設定側で同じキーを定義させない
+check('予約語 talk はキーに使えない', !isset($reserved['messages']['talk']), json_encode(array_keys($reserved['messages'] ?? []), JSON_UNESCAPED_UNICODE));
 check('残りのキーは使える', ($reserved['messages']['ok'] ?? '') === 'わかりました');
 
 $tooMany = $responsesOf(['a' => 'A', 'b' => 'B', 'c' => 'C', 'd' => 'D']);

@@ -5,8 +5,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## プロジェクト概要
 
 親機・子機の双方を Web ブラウザで動かすポーリング方式の簡易ドアベル。
-PHP 8.4 + SQLite(PDO) + バニラ JS のみで、フレームワーク・パッケージマネージャ・ビルド工程は一切ない。
+PHP 8.4 + SQLite(PDO) + バニラ JS。
+
+**現状は依存ゼロ**で、フレームワーク・パッケージマネージャ・ビルド工程を使っていない。
 編集したファイルがそのまま動作するため、ビルドコマンドは存在しない。
+
+ただしこれは初期実装時の要望によるもので、**今後の制約ではない**。
+必要なら Composer や常駐プロセス（WebSocket サーバー等）を導入してよい。
+導入する場合は次の 2 点を守ること。
+
+- `vendor/` は公開ディレクトリの外に置く（`config/` `src/` と同じ扱い。`.htaccess` も添える）
+- 設置手順が「ファイルを置くだけ」ではなくなるので、インストールと更新の手順を
+  `README_ja.md` に書き足す
 
 UI 文言・コード内コメント・コミットメッセージはすべて日本語で書く。
 
@@ -33,6 +43,11 @@ php -r "require 'src/bootstrap.php'; Doorbell\Webhook::dispatch();"
 
 # DB をリセット（スキーマは初回アクセス時に自動生成される）
 rm -f data/doorbell.sqlite data/doorbell.sqlite-shm data/doorbell.sqlite-wal
+
+# 通話（テスト版機能）を有効にして開発サーバーを動かす。
+# getUserMedia は安全な接続でしか動かないが、127.0.0.1 は例外なので手元では確認できる
+printf '<?php\nreturn ["voice_call" => true];\n' > /tmp/voice_config.php
+DOORBELL_CONFIG_PATH=/tmp/voice_config.php php -S 127.0.0.1:8791 -t public
 
 # ロジックを CLI から直接叩いて確認する
 php -r "require 'src/bootstrap.php'; use Doorbell\Doorbell; print_r(Doorbell::issueId('127.0.0.1'));"
@@ -106,6 +121,10 @@ cron やバックグラウンドジョブは存在しない。以下はすべて
 - IDの自動失効: `Doorbell::expireOldIds()` を `bootstrap.php` が**毎リクエスト**呼ぶ。
   「もう使えない」ことが動作に直結するので、cleanup のような確率実行にしない。
   `id_lifetime` が 0（既定）なら DB に触らず即座に返る
+- 通話の期限: `Voice::expireSessions()` が接続待ちの時間切れ（`voice_connect_timeout`）・
+  通話時間の上限（`voice_max_seconds`）・相手のポーリング途絶（`voice_stale_seconds`）を
+  まとめて確定する。`Voice` の各メソッドと `summaryFor()` の先頭で呼ぶ。
+  `voice_call` が無効なら DB に触らず即座に返る
 
 ### 認証と端末の同一性は別物
 
@@ -141,6 +160,38 @@ cron やバックグラウンドジョブは存在しない。以下はすべて
 履歴の並び順は `COALESCE(responded_at, last_called_at) DESC`。複数子機が並行して呼び出すと
 作成順と決着順がずれ、`id` 順では表示時刻が前後するため。
 
+### 通話（テスト版機能。既定で無効）
+
+親機↔子機のボイスチャット（WebRTC）。`voice_call` を有効にしたときだけ動く。
+音声・映像はブラウザ同士が直接やり取りし、サーバーは SDP / ICE の受け渡しだけを担う。
+構成は固定で、**音声は双方向・映像は子機→親機の片方向**、offer を出すのは常に親機。
+
+| ファイル | 役割 |
+| --- | --- |
+| `src/Voice.php` | シグナリングと通話の生死。`voice_sessions` / `voice_signals` の 2 テーブル |
+| `public/assets/voice.js` | ブラウザ側。`app.js` は IIFE なので `DoorbellVoice.create(deps)` で依存を渡して組み立てる |
+
+- **接続が成立するまで `calls` を `waiting` のまま残す。** `voice_connected` を受けて初めて
+  `Doorbell::answerByVoice()` が `answered` / `response_key = 'talk'` に決着させる。
+  先に応答済みにすると、ICE が通らなかったときに親機が通常の応答へ戻れず来訪者が置き去りになる。
+  **この順序を入れ替えないこと。**
+- `calls.status` の CHECK 制約（`waiting` / `answered` / `no_answer`）と `expireStaleCalls()` には
+  一切手を入れていない。通話は calls と**並走する別テーブルのセッション**として持つ
+- `respondBy()` は `talk` を受け付けない（`responses()` にないため）。外部連携から通話を
+  開始できてしまうと、誰も話していないのに「通話中」を子機に見せることになる。
+  UPDATE の実体は `Doorbell::closeCall()` に切り出してあり、`respondBy()` と
+  `answerByVoice()` の 2 か所から呼ぶ。応答の種類を増やすときはここを通すこと
+- **当事者チェックを必ず通す。** `Voice::sessionFor()` が親機・子機どちらかの `device_id` と
+  一致することを確かめる。SDP は相手のブラウザの `setRemoteDescription()` にそのまま渡るため、
+  セッションIDを推測して第三者が割り込めてはいけない。SDP / ICE には 16KB の上限もある
+- シグナルは**受け取った時点で削除**する（配送は1回きり。カーソルを持たない）
+- `voice_call` が無効なら `api.php` も `Voice` も通話に一切触れない（`child_link_login` と同じ流儀）
+- SDP / ICE は state に載せず、専用の軽量な `voice_poll` で運ぶ。`voice_poll_interval`（既定1秒）で
+  回すため、`history` を含む state を毎秒返すのは重すぎる。**画面表示に関わる要約
+  （`Voice::summaryFor()`）だけを state の `voice` に載せる**
+- レート制限は `voice` バケット（`rate_limit.max_voice`）に分ける。`req` と同じ枠にすると
+  通話が上限を食い潰し、画面全体のポーリングまで止まる
+
 ## 変更時の注意点
 
 ### SQLite の型親和性（過去に実バグを踏んでいる）
@@ -168,7 +219,8 @@ WHERE created_at <= :deadline
 - **応答ボタンは設定 `responses` で決まる**（既定は `in1` / `in5` / `away` の3件）。
   クライアントからはキーだけを受け取り、文言は `Doorbell::responses()` を使う。
   キーを固定値として書かないこと。`Config::normalizeResponses()` が件数・文字数・
-  予約語（`timeout`）を検証し、使える定義が1件も残らなければ既定に戻す
+  予約語（`RESERVED_RESPONSE_KEYS` = `timeout` / `talk`）を検証し、
+  使える定義が1件も残らなければ既定に戻す
   （設定ミスで親機が応答できなくなるのを避けるため）。
   親機のカード表示は `grid-auto-flow: column` で件数に追従する
 - 設定項目を増やすときは `Config::DEFAULTS` と `config/config.sample.php` の両方に追加する。
@@ -207,7 +259,19 @@ WHERE created_at <= :deadline
   **ユーザー操作（ログインボタン・コールボタン・再接続ボタン）の中で `Ringtone.unlock()` を呼ぶ**
 - 接続不能が `offline_stop_seconds` 続いたらポーリングを停止して全画面のオーバーレイを出す。
   古い画面のまま「待ち受け中」に見える状態を作らないための仕様なので、無効化しないこと
+- **子機は「呼び出す」を押した時点で `getUserMedia()` を先取りする**（`Voice.prime()`）。
+  無人設置の子機は着信時にユーザー操作がなく、権限を求められない。`Ringtone.unlock()` が
+  同じ制約で同じ場所に置かれているのと同じ理由。決着したら `Voice.disarm()` で解放する
+- **通話のポーリングは、セッションを持っていないうちに「切断」と判断しない。**
+  親機は通話開始で画面を描き直すため、`voice_start` の応答より先に `voice_poll` が走る。
+  ここで畳むと、始めたばかりの通話が即座に切れる（実際に踏んだ）
+- 通話のポーリング失敗は `handleOffline()` とは別扱いにする。全画面オーバーレイを出すと、
+  通話が一時的に落ちただけで呼び出し自体まで見えなくなる
+- 受信メディアの再生先は**役割で決め打ちにする**（親機は video 要素、子機は audio 要素）。
+  届いたトラックで切り替えると、音声だけ先に届いた段階で両方に繋いで二重に鳴る
 
 ## 参照
 
 運用・設置手順・全設定項目の一覧は `README.md` を参照。
+通話（テスト版機能）の設置条件・設定項目・トラブルシュートは `voice_ja.md` を参照。
+テスト版の機能は README に混ぜず、機能ごとに独立した Markdown にまとめる。

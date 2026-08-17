@@ -128,6 +128,64 @@ try {
             Doorbell::respond($device, (int) ($input['call_id'] ?? 0), (string) ($input['response'] ?? ''));
             Http::json(['ok' => true, 'state' => state($device)]);
 
+        // ---- 通話（テスト版機能）----------------------------------------
+        // 設定で明示的に有効にしたときだけ受け付ける。無効なら voice_* を一切扱わない
+        case 'voice_start':
+        case 'voice_poll':
+        case 'voice_signal':
+        case 'voice_connected':
+        case 'voice_end':
+            if (!Voice::enabled()) {
+                throw new AppError('通話機能は無効です。', 'voice_disabled', 403);
+            }
+
+            $device = currentDevice();
+
+            // 通話中は 1 秒間隔でポーリングするため、通常のリクエストとは別枠で数える。
+            // 同じ枠だと通話が max_requests を食い潰し、画面全体のポーリングまで止まる
+            Http::rateLimit('voice', $ip, (int) $limits['max_voice']);
+            Doorbell::touch((int) $device['id'], $ip);
+
+            $sessionId = (int) ($input['session_id'] ?? 0);
+
+            if ($action === 'voice_start') {
+                if ((string) $device['role'] !== 'parent') {
+                    throw new AppError('親機のみ通話を開始できます。', 'forbidden', 403);
+                }
+
+                Http::json([
+                    'ok'      => true,
+                    'session' => Voice::start($device, (int) ($input['call_id'] ?? 0), (array) ($input['sdp'] ?? [])),
+                ]);
+            }
+
+            if ($action === 'voice_poll') {
+                Http::json(['ok' => true, ...Voice::poll($device, $sessionId)]);
+            }
+
+            if ($action === 'voice_signal') {
+                Voice::signal(
+                    $device,
+                    $sessionId,
+                    (string) ($input['kind'] ?? ''),
+                    (array) ($input['payload'] ?? []),
+                );
+                Http::json(['ok' => true]);
+            }
+
+            if ($action === 'voice_connected') {
+                if ((string) $device['role'] !== 'parent') {
+                    throw new AppError('親機のみ操作できます。', 'forbidden', 403);
+                }
+
+                // 呼び出しがここで決着するので、画面状態を一式返す
+                $session = Voice::connected($device, $sessionId);
+                Http::json(['ok' => true, 'session' => $session, 'state' => state($device)]);
+            }
+
+            Voice::end($device, $sessionId, (string) ($input['reason'] ?? 'hangup'));
+            Http::json(['ok' => true, 'state' => state($device)]);
+
         default:
             throw new AppError('不明な操作です。', 'unknown_action', 404);
     }

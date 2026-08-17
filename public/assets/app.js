@@ -193,6 +193,30 @@
     if (message) showError.timer = setTimeout(() => { el.hidden = true; }, 6000);
   }
 
+  /** 画面状態はそのままに描き直す（通話の状態が変わったときに使う） */
+  function rerender() {
+    if (!app.state) return;
+    if (app.role === 'parent') renderParent(app.state);
+    else renderChild(app.state);
+    tick();
+  }
+
+  function formatClock(seconds) {
+    return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* 通話（テスト版機能）                                               */
+  /* ------------------------------------------------------------------ */
+
+  const Voice = window.DoorbellVoice.create({
+    api,
+    cfg,
+    onChange: rerender,
+    onState: (state) => applyState(state),
+    onError: showError,
+  });
+
   /* ------------------------------------------------------------------ */
   /* ログイン                                                           */
   /* ------------------------------------------------------------------ */
@@ -343,6 +367,7 @@
     app.offlineSince = null;
     app.role = null;
     app.state = null;
+    Voice.hangup('logout');
     $('input-id').value = recall(STORE.lastId);
     $('input-name').value = recall(STORE.lastName);
     const errorEl = $('login-error');
@@ -466,11 +491,54 @@
     parentResponses.appendChild(button);
   });
 
+  // 呼び出しが1件のときの通話ボタン。応答ボタンの3列グリッドとは別の行に置く
+  const parentVoice = $('parent-voice');
+  if (Voice.available()) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'btn btn-voice';
+    button.textContent = cfg.voiceCallLabel;
+    button.addEventListener('click', () => startVoice((app.state?.activeCalls ?? [])[0], parentVoice));
+    parentVoice.appendChild(button);
+    parentVoice.hidden = false;
+  }
+
   function showParentStage(name) {
-    ['idle', 'calling', 'multi', 'answered'].forEach((key) => {
+    ['idle', 'calling', 'multi', 'answered', 'talking'].forEach((key) => {
       show($(`parent-${key}`), key === name);
     });
   }
+
+  /**
+   * 通話を始める。
+   * getUserMedia はユーザー操作の中でしか権限を求められないので、
+   * このクリックハンドラから直接 Voice.start() を呼ぶこと。
+   */
+  async function startVoice(call, container) {
+    if (!call) return;
+
+    Ringtone.stop();
+    const buttons = [...container.querySelectorAll('button')];
+    buttons.forEach((b) => { b.disabled = true; });
+
+    try {
+      await Voice.start(call);
+    } finally {
+      buttons.forEach((b) => { b.disabled = false; });
+    }
+  }
+
+  function renderParentTalk() {
+    const talking = Voice.phase === 'talking';
+    $('parent-talk-title').textContent = talking ? '通話中' : '接続しています…';
+    $('parent-talk-peer').textContent = Voice.peerName;
+    show($('parent-talk-novideo'), !Voice.hasRemoteVideo);
+    show($('parent-talk-clock'), talking);
+    $('voice-mute').textContent = Voice.muted ? '自分の音声を戻す' : '自分の音声を切る';
+  }
+
+  $('voice-mute').addEventListener('click', () => Voice.toggleMute());
+  $('voice-hangup').addEventListener('click', () => Voice.hangup('hangup'));
 
   /** 他の呼び出しを隠さずに送信結果を知らせる */
   function showToast(message) {
@@ -523,6 +591,26 @@
   function renderParent(state) {
     $('parent-name').textContent = state.displayName;
     const calls = state.activeCalls ?? [];
+
+    Voice.watch(calls.length > 0);
+
+    if (Voice.busy()) {
+      // 通話している呼び出しは決着済みなので、呼び出しの通知は出さない。
+      // knownCalls も現状に合わせておかないと「応答がないまま終了した」と誤判定する
+      Ringtone.stop();
+      app.knownCalls = new Map(calls.map((call) => [call.id, call.callCount]));
+      app.parentNotice = '';
+      resetCards();
+      renderParentTalk();
+      showParentStage('talking');
+      document.title = '📞 通話中';
+      return;
+    }
+
+    if (Voice.lastError) {
+      showError(Voice.lastError);
+      Voice.lastError = '';
+    }
 
     // 新しい呼び出し、または応答待ち中の再呼び出しがあれば鳴らす（複数同時でも1回だけ）
     const hasNew = calls.some((call) => (app.knownCalls.get(call.id) ?? -1) < call.callCount);
@@ -674,10 +762,28 @@
     });
 
     root.append(head, actions);
+
+    if (Voice.available()) {
+      const voiceRow = document.createElement('div');
+      voiceRow.className = 'call-card-voice';
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'btn btn-voice';
+      button.textContent = cfg.voiceCallLabel;
+      button.addEventListener('click', () => startVoice(card.call, voiceRow));
+      voiceRow.appendChild(button);
+      root.appendChild(voiceRow);
+    }
+
     return card;
   }
 
   function tickParent() {
+    if (Voice.busy()) {
+      $('parent-talk-elapsed').textContent = formatClock(Voice.elapsed(nowSec()));
+      return;
+    }
+
     const calls = app.state?.activeCalls ?? [];
     if (calls.length === 0) return;
 
@@ -704,10 +810,16 @@
   /* 子機                                                               */
   /* ------------------------------------------------------------------ */
 
+  $('child-voice-hangup').addEventListener('click', () => Voice.hangup('hangup'));
+
   $('call-button').addEventListener('click', async () => {
     const button = $('call-button');
     button.disabled = true;
     Ringtone.play();
+
+    // 着信は自動なので、そのタイミングではマイクとカメラの権限を求められない。
+    // ユーザー操作であるこのクリックのうちに確保しておく（失敗しても呼び出しは続ける）
+    Voice.prime().then(rerender);
 
     try {
       const data = await api('call');
@@ -728,6 +840,12 @@
     renderChild(app.state);
   });
 
+  function showChildStage(name) {
+    ['idle', 'waiting', 'answered', 'talking'].forEach((key) => {
+      show($(`child-${key}`), key === name);
+    });
+  }
+
   function renderChild(state) {
     $('child-name').textContent = state.displayName;
     show($('child-parent-offline'), !state.parentOnline);
@@ -735,12 +853,31 @@
     const call = state.currentCall;
     const closed = !call || call.id === app.dismissedCallId;
 
+    // 呼び出し中と通話中だけ、通話用の高頻度ポーリングを回す
+    Voice.watch(call?.status === 'waiting');
+
+    if (Voice.busy()) {
+      Ringtone.stop();
+      $('child-talk-peer').textContent = Voice.phase === 'talking'
+        ? `${Voice.peerName} と通話中`
+        : '接続しています…';
+      show($('child-talk-self'), Voice.hasLocalVideo());
+      show($('child-talk-clock'), Voice.phase === 'talking');
+      showChildStage('talking');
+      document.title = '📞 通話中';
+      return;
+    }
+
+    if (Voice.lastError) {
+      showError(Voice.lastError);
+      Voice.lastError = '';
+    }
+
     if (closed) {
       Ringtone.stop();
+      Voice.disarm();
       renderHistory($('child-history'), $('child-history-empty'), state.history, false);
-      show($('child-waiting'), false);
-      show($('child-answered'), false);
-      show($('child-idle'), true);
+      showChildStage('idle');
       document.title = 'ドアベル（子機）';
       return;
     }
@@ -749,27 +886,30 @@
       $('child-waiting-sub').textContent = call.callCount > 1
         ? `応答をお待ちください（呼び出し ${call.callCount} 回）`
         : '応答をお待ちください';
-      show($('child-idle'), false);
-      show($('child-answered'), false);
-      show($('child-waiting'), true);
+      show($('child-voice-armed'), Voice.armed);
+      showChildStage('waiting');
       document.title = '🔔 呼び出し中';
       return;
     }
 
     // 応答あり（親機の応答、または不在判定）
     Ringtone.stop();
+    Voice.disarm();
     const answered = call.status === 'answered';
     $('child-responder').textContent = answered ? `${call.responder} からの応答` : '';
     show($('child-responder'), answered);
     $('child-answer-message').textContent = call.message || '';
     $('child-answer-message').classList.toggle('is-negative', !answered);
-    show($('child-idle'), false);
-    show($('child-waiting'), false);
-    show($('child-answered'), true);
+    showChildStage('answered');
     document.title = 'ドアベル（子機）';
   }
 
   function tickChild() {
+    if (Voice.busy()) {
+      $('child-talk-elapsed').textContent = formatClock(Voice.elapsed(nowSec()));
+      return;
+    }
+
     const call = app.state?.currentCall;
     if (!call || call.id === app.dismissedCallId) return;
 

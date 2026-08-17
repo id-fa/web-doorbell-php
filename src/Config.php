@@ -12,6 +12,15 @@ final class Config
     /** 応答ボタンの数の上限（親機のカード表示が3列で組まれているため） */
     public const MAX_RESPONSES = 3;
 
+    /**
+     * responses に使えないキー。
+     *
+     * 'timeout' は不在確定、'talk' は通話成立に使う組み込みの応答で、どちらも
+     * 設定の応答ボタンとは別系統で書き込まれる。同じキーを設定側で定義できると
+     * 履歴の意味が二重になるため受け付けない。
+     */
+    private const RESERVED_RESPONSE_KEYS = ['timeout', 'talk'];
+
     /** 設定ファイルが存在しない/項目が欠けている場合に使う既定値 */
     private const DEFAULTS = [
         'polling_interval'       => 10,
@@ -48,11 +57,24 @@ final class Config
         'deletion_grace_seconds' => 0,
         'id_lifetime'            => 0,
         'trust_proxy'            => false,
+        // 通話（テスト版機能）。詳細は voice_ja.md を参照
+        'voice_call'             => false,
+        'voice_call_label'       => '通話する',
+        'voice_call_message'     => 'ここから通話します',
+        'voice_video'            => true,
+        'voice_ice_servers'      => [],
+        'voice_poll_interval'    => 1,
+        'voice_connect_timeout'  => 20,
+        'voice_max_seconds'      => 300,
+        'voice_stale_seconds'    => 15,
         'rate_limit'             => [
             'window'       => 60,
             'max_requests' => 300,
             'max_logins'   => 10,
             'max_calls'    => 20,
+            // 通話は 1 秒間隔でポーリングするため、通常のリクエストとは別枠にする。
+            // 同じ枠にすると通話中に max_requests を食い潰して画面全体が止まる
+            'max_voice'    => 900,
         ],
     ];
 
@@ -106,6 +128,15 @@ final class Config
         $values['id_lifetime']            = max(0, (int) $values['id_lifetime']);
         $values['webhook_timeout']        = min(30, max(1, (int) $values['webhook_timeout']));
         $values['webhook_max_attempts']   = min(20, max(1, (int) $values['webhook_max_attempts']));
+        $values['voice_call']             = (bool) $values['voice_call'];
+        $values['voice_video']            = (bool) $values['voice_video'];
+        $values['voice_call_label']       = self::cleanText($values['voice_call_label'], 12, self::DEFAULTS['voice_call_label']);
+        $values['voice_call_message']     = self::cleanText($values['voice_call_message'], 60, self::DEFAULTS['voice_call_message']);
+        $values['voice_poll_interval']    = min(10, max(1, (int) $values['voice_poll_interval']));
+        $values['voice_connect_timeout']  = max(5, (int) $values['voice_connect_timeout']);
+        $values['voice_max_seconds']      = max(30, (int) $values['voice_max_seconds']);
+        $values['voice_stale_seconds']    = max(5, (int) $values['voice_stale_seconds']);
+        $values['voice_ice_servers']      = self::normalizeIceServers($values['voice_ice_servers']);
 
         // 送信先ホストの許可リスト。小文字に揃え、空の項目は落とす
         $hosts = is_array($values['webhook_allowed_hosts']) ? $values['webhook_allowed_hosts'] : [];
@@ -140,8 +171,8 @@ final class Config
         foreach (is_array($raw) ? $raw : [] as $key => $entry) {
             $key = (string) $key;
 
-            // 'timeout' は不在確定に使っている予約語なので受け付けない
-            if (preg_match('/\A[A-Za-z0-9_]{1,16}\z/', $key) !== 1 || $key === 'timeout') {
+            // 組み込みの応答と同じキーは受け付けない
+            if (preg_match('/\A[A-Za-z0-9_]{1,16}\z/', $key) !== 1 || in_array($key, self::RESERVED_RESPONSE_KEYS, true)) {
                 continue;
             }
 
@@ -163,6 +194,52 @@ final class Config
         }
 
         return $result === [] ? self::DEFAULTS['responses'] : $result;
+    }
+
+    /** 表示に使う短い文字列を整える（制御文字を落とし、長さを切り、空なら既定値に戻す） */
+    private static function cleanText(mixed $raw, int $limit, string $fallback): string
+    {
+        $text = mb_substr(trim(preg_replace('/[\x00-\x1F\x7F]+/u', '', (string) $raw) ?? ''), 0, $limit);
+
+        return $text === '' ? $fallback : $text;
+    }
+
+    /**
+     * 通話の ICE サーバー設定を整える。
+     *
+     * この値はブラウザにそのまま渡るため、誰でも読める。TURN の固定の認証情報を
+     * 書くべきではない（voice_ja.md に明記）。
+     * 受け付ける書き方は 2 通り。
+     *   'stun:stun.example.net:3478'
+     *   ['urls' => 'turn:turn.example.net:3478', 'username' => '...', 'credential' => '...']
+     *
+     * @return list<array{urls: string, username?: string, credential?: string}>
+     */
+    private static function normalizeIceServers(mixed $raw): array
+    {
+        $result = [];
+        foreach (is_array($raw) ? $raw : [] as $entry) {
+            $urls = is_array($entry) ? (string) ($entry['urls'] ?? '') : (string) $entry;
+            $urls = trim($urls);
+
+            // ブラウザに渡す前に形式を絞る。想定外のスキームは黙って落とす
+            if (preg_match('#\A(stun|stuns|turn|turns):[A-Za-z0-9._\-\[\]:]+(\?transport=(udp|tcp))?\z#', $urls) !== 1) {
+                if ($urls !== '') {
+                    error_log('doorbell config: voice_ice_servers に使えない指定があります: ' . $urls);
+                }
+                continue;
+            }
+
+            $server = ['urls' => $urls];
+            if (is_array($entry) && ($entry['username'] ?? '') !== '') {
+                $server['username']   = (string) $entry['username'];
+                $server['credential'] = (string) ($entry['credential'] ?? '');
+            }
+
+            $result[] = $server;
+        }
+
+        return $result;
     }
 
     /**
@@ -228,6 +305,15 @@ final class Config
             'responseViewTimeout' => self::int('response_view_timeout'),
             'offlineStopSeconds'  => self::int('offline_stop_seconds'),
             'childLogoutPassword' => (bool) self::get('child_logout_password'),
+            'voiceCall'           => (bool) self::get('voice_call'),
+            'voiceCallLabel'      => (string) self::get('voice_call_label'),
+            'voiceVideo'          => (bool) self::get('voice_video'),
+            // 誰でも読める値なので、TURN の固定の認証情報を書かせない前提の設定にしてある
+            'voiceIceServers'     => (array) self::get('voice_ice_servers'),
+            'voicePollInterval'   => self::int('voice_poll_interval'),
+            'voiceConnectTimeout' => self::int('voice_connect_timeout'),
+            'voiceMaxSeconds'     => self::int('voice_max_seconds'),
+            'voiceStaleSeconds'   => self::int('voice_stale_seconds'),
         ];
     }
 }

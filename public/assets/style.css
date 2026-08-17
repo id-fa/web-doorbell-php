@@ -798,3 +798,97 @@ button:focus-visible {
   margin: 26px 0 0;
   font-size: 1rem;
 }
+
+/* ---------- 通話（テスト版機能） ---------- */
+
+/* 応答ボタンの 3 列グリッドとは別の行に置く（件数に追従させないため） */
+.voice-launch {
+  margin-top: 4px;
+}
+
+.voice-launch[hidden] { display: none; }
+
+.call-card-voice {
+  margin-top: 8px;
+}
+
+.btn-voice {
+  background: var(--accent-strong);
+  border-color: transparent;
+  color: #fff;
+}
+
+.btn-danger {
+  background: var(--danger);
+  border-color: transparent;
+  color: #fff;
+}
+
+.stage-talk {
+  justify-content: flex-start;
+  gap: 4px;
+}
+
+.stage-talk .stage-title { color: var(--ok); }
+
+/* 子機から届く映像。届くまで（音声のみのとき）は枠に「映像なし」を出す */
+.talk-video-frame {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 4 / 3;
+  margin: 12px 0;
+  background: #000;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+.talk-video-frame video {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+.talk-video-empty {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin: 0;
+  color: var(--text-dim);
+  font-size: 0.9rem;
+}
+
+.talk-video-empty[hidden] { display: none; }
+
+/* 子機の自映像。カメラが自分を映していることが分かれば十分なので小さく出す */
+.talk-self-frame {
+  width: 140px;
+  margin: 12px auto;
+  border-radius: 12px;
+  overflow: hidden;
+  background: #000;
+  border: 1px solid var(--border);
+}
+
+.talk-self-frame[hidden] { display: none; }
+
+.talk-self-frame video {
+  display: block;
+  width: 100%;
+  transform: scaleX(-1); /* 自分の姿は鏡像のほうが自然 */
+}
+
+.talk-actions {
+  display: grid;
+  gap: 8px;
+  width: 100%;
+}
+
+.notice-info {
+  background: rgb(56 189 248 / 12%);
+  color: var(--text-dim);
+  border: 1px solid rgb(56 189 248 / 35%);
+  font-weight: 500;
+}

@@ -677,6 +677,35 @@ final class Doorbell
             throw new AppError('不正な応答です。', 'invalid_response');
         }
 
+        return self::closeCall($doorbellId, $responderName, $callId, $responseKey, $responses[$responseKey]);
+    }
+
+    /**
+     * 通話が成立したときの応答。
+     *
+     * 設定の応答ボタン（responses）とは別系統の組み込みの応答なので respondBy() は通さない。
+     * respondBy() に 'talk' を通せるようにすると、外部連携（Slack 等）からも通話中に
+     * できてしまい、実際には誰も話していない状態を子機に見せることになるため。
+     */
+    public static function answerByVoice(string $doorbellId, string $responderName, int $callId): array
+    {
+        return self::closeCall(
+            $doorbellId,
+            $responderName,
+            $callId,
+            'talk',
+            (string) Config::get('voice_call_message'),
+        );
+    }
+
+    /** 応答待ちの呼び出しを決着させる（応答文言は呼び出し側が決める） */
+    private static function closeCall(
+        string $doorbellId,
+        string $responderName,
+        int $callId,
+        string $responseKey,
+        string $message,
+    ): array {
         self::expireStaleCalls($doorbellId);
 
         $now  = time();
@@ -693,7 +722,7 @@ final class Doorbell
             ':now'      => $now,
             ':name'     => $responderName,
             ':key'      => $responseKey,
-            ':message'  => $responses[$responseKey],
+            ':message'  => $message,
             ':id'       => $callId,
             ':doorbell' => $doorbellId,
         ]);
@@ -767,6 +796,7 @@ final class Doorbell
             (string) $device['doorbell_id'],
             (string) $device['display_name'],
             'parent',
+            (int) $device['id'],
         );
     }
 
@@ -774,9 +804,15 @@ final class Doorbell
      * 呼び出しを受ける側（親機・外部連携）に見せる状態。
      *
      * 端末レコードではなく ID と表示名で受け取るのは、連携からも同じ状態を返せるようにするため。
+     * $deviceId は通話の当事者判定にだけ使う。連携には端末レコードがないので 0 になる
+     * （＝連携からは通話に関われない）。
      */
-    public static function monitorState(string $doorbellId, string $viewerName, string $role): array
-    {
+    public static function monitorState(
+        string $doorbellId,
+        string $viewerName,
+        string $role,
+        int $deviceId = 0,
+    ): array {
         self::expireStaleCalls($doorbellId);
 
         // 複数の子機から同時に呼び出される場合があるため、応答待ちを全件返す。
@@ -796,6 +832,10 @@ final class Doorbell
             'activeCalls' => array_map(self::exportCall(...), $stmt->fetchAll()),
             'children'    => self::childStatuses($doorbellId),
             'history'     => self::doorbellHistory($doorbellId),
+            // 進行中の通話の要約。SDP/ICE はここには載せない（画面表示に要らないうえ、
+            // 履歴込みの重い state を 1 秒間隔で回すことになるため）。生のやり取りは
+            // api.php の voice_poll が担う
+            'voice'       => Voice::summaryFor($doorbellId, $deviceId),
         ];
     }
 
@@ -834,6 +874,7 @@ final class Doorbell
                 || Integration::existsFor($doorbellId),
             'currentCall'  => $current,
             'history'      => self::history($deviceId),
+            'voice'        => Voice::summaryFor($doorbellId, $deviceId),
         ];
     }
 
@@ -1021,6 +1062,13 @@ final class Doorbell
 
         // 送信を諦めた通知が残ることはないが、連携を消した直後などの取りこぼしに備える
         $pdo->prepare('DELETE FROM webhook_events WHERE created_at < :limit')
+            ->execute([':limit' => time() - 86400]);
+
+        // 配送済みのシグナルは受け取った時点で消えるが、片方が落ちた通話の取りこぼしに備える
+        $pdo->prepare('DELETE FROM voice_signals WHERE created_at < :limit')
+            ->execute([':limit' => time() - 3600]);
+
+        $pdo->prepare("DELETE FROM voice_sessions WHERE status = 'ended' AND ended_at < :limit")
             ->execute([':limit' => time() - 86400]);
     }
 

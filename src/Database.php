@@ -128,6 +128,44 @@ final class Database
         $pdo->exec('CREATE INDEX IF NOT EXISTS idx_calls_pending ON calls (doorbell_id, status, id)');
         $pdo->exec('CREATE INDEX IF NOT EXISTS idx_calls_device ON calls (device_id, id)');
 
+        // 通話（voice_call が有効なときだけ使う）。呼び出しと並走するセッションとして持つ。
+        // calls 側の status には手を入れず、通話が成立した時点で通常の応答と同じ形
+        // （answered / response_key = 'talk'）に着地させる。
+        $pdo->exec(<<<'SQL'
+            CREATE TABLE IF NOT EXISTS voice_sessions (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                call_id          INTEGER NOT NULL,
+                doorbell_id      TEXT    NOT NULL,
+                parent_device_id INTEGER NOT NULL,
+                child_device_id  INTEGER NOT NULL,
+                parent_name      TEXT    NOT NULL,
+                child_name       TEXT    NOT NULL,
+                status           TEXT    NOT NULL CHECK (status IN ('offering', 'answered', 'connected', 'ended')),
+                end_reason       TEXT    NOT NULL DEFAULT '',
+                created_at       INTEGER NOT NULL,
+                connected_at     INTEGER NOT NULL DEFAULT 0,
+                ended_at         INTEGER NOT NULL DEFAULT 0,
+                parent_seen_at   INTEGER NOT NULL,
+                child_seen_at    INTEGER NOT NULL DEFAULT 0,
+                FOREIGN KEY (call_id) REFERENCES calls (id) ON DELETE CASCADE
+            )
+        SQL);
+        $pdo->exec('CREATE INDEX IF NOT EXISTS idx_voice_active ON voice_sessions (doorbell_id, status, id)');
+
+        // SDP / ICE の受け渡し。相手が受け取った時点で削除するので、残っているのは未配送のものだけ。
+        $pdo->exec(<<<'SQL'
+            CREATE TABLE IF NOT EXISTS voice_signals (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id   INTEGER NOT NULL,
+                to_device_id INTEGER NOT NULL,
+                kind         TEXT    NOT NULL CHECK (kind IN ('offer', 'answer', 'ice')),
+                payload      TEXT    NOT NULL,
+                created_at   INTEGER NOT NULL,
+                FOREIGN KEY (session_id) REFERENCES voice_sessions (id) ON DELETE CASCADE
+            )
+        SQL);
+        $pdo->exec('CREATE INDEX IF NOT EXISTS idx_voice_signals_inbox ON voice_signals (to_device_id, id)');
+
         // 子機の自動ログイン用URL（child_link_login が有効なときだけ使う）。
         // トークンはそれ自体が認証情報なので、URLを知っている端末は誰でも子機になれる。
         $pdo->exec(<<<'SQL'
